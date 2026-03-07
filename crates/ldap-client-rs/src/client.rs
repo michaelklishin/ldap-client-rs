@@ -27,6 +27,7 @@ use crate::conn::{self, LdapStream};
 const STARTTLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 const NOTICE_OF_DISCONNECTION_OID: &str = "1.3.6.1.4.1.1466.20036";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_MESSAGE_SIZE: u32 = 10 * 1024 * 1024;
 const MAX_SEARCH_ENTRIES: usize = 500_000;
 
 #[derive(Debug, Clone)]
@@ -82,6 +83,7 @@ pub struct ClientBuilder {
     tls_config: Option<Arc<ClientConfig>>,
     connect_timeout: Duration,
     request_timeout: Duration,
+    max_message_size: u32,
     base_dn: Option<String>,
     service_account_dn: Option<String>,
     service_account_password: Option<SecretString>,
@@ -97,6 +99,7 @@ impl ClientBuilder {
             tls_config: None,
             connect_timeout: DEFAULT_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             base_dn: None,
             service_account_dn: None,
             service_account_password: None,
@@ -120,6 +123,7 @@ impl ClientBuilder {
             tls_config: None,
             connect_timeout: DEFAULT_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             base_dn: parsed.base_dn,
             service_account_dn: None,
             service_account_password: None,
@@ -181,6 +185,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maximum accepted LDAP message size (10 MiB by default).
+    pub fn max_message_size(mut self, max: u32) -> Self {
+        self.max_message_size = max;
+        self
+    }
+
     pub async fn connect(self) -> Result<Client, Error> {
         let addr = format_addr(&self.host, self.port);
         debug!(addr = %addr, transport = ?self.transport, "connecting");
@@ -207,7 +217,7 @@ impl ClientBuilder {
                 if self.transport == Transport::Tls {
                     conn::upgrade_to_tls(tcp, server_name, tls_config.clone()).await?
                 } else {
-                    perform_start_tls(tcp, server_name, tls_config.clone(), self.request_timeout)
+                    perform_start_tls(tcp, server_name, tls_config.clone(), self.request_timeout, self.max_message_size)
                         .await?
                 }
             }
@@ -218,11 +228,13 @@ impl ClientBuilder {
         } else {
             1
         };
+        let codec = LdapCodec::new().with_max_message_size(self.max_message_size);
         Ok(Client {
-            framed: Mutex::new(Framed::new(stream, LdapCodec::default())),
+            framed: Mutex::new(Framed::new(stream, codec)),
             next_id: AtomicI32::new(start_id),
             connected: AtomicBool::new(true),
             request_timeout: self.request_timeout,
+            max_message_size: self.max_message_size,
             base_dn: self.base_dn,
             referral_policy: self.referral_policy,
             host: self.host,
@@ -241,8 +253,9 @@ async fn perform_start_tls(
     server_name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
     timeout: Duration,
+    max_message_size: u32,
 ) -> Result<LdapStream, Error> {
-    let mut framed = Framed::new(tcp, LdapCodec::default());
+    let mut framed = Framed::new(tcp, LdapCodec::new().with_max_message_size(max_message_size));
 
     let msg = LdapMessage {
         message_id: MessageId(1),
@@ -286,6 +299,7 @@ pub struct Client {
     next_id: AtomicI32,
     connected: AtomicBool,
     request_timeout: Duration,
+    max_message_size: u32,
     base_dn: Option<String>,
     referral_policy: ReferralPolicy,
     // Fields stored for reconnect.
@@ -360,6 +374,7 @@ impl Client {
                         server_name,
                         self.tls_config.clone(),
                         self.request_timeout,
+                        self.max_message_size,
                     )
                     .await?
                 }
@@ -373,7 +388,7 @@ impl Client {
         };
 
         let mut framed = self.framed.lock().await;
-        *framed = Framed::new(stream, LdapCodec::default());
+        *framed = Framed::new(stream, LdapCodec::new().with_max_message_size(self.max_message_size));
         self.next_id.store(start_id, Ordering::Relaxed);
         self.connected.store(true, Ordering::Relaxed);
         drop(framed);
@@ -832,7 +847,7 @@ impl Client {
                 scope,
                 deref_aliases: DerefAliases::NeverDerefAliases,
                 size_limit: 2,
-                time_limit: 0,
+                time_limit: self.request_timeout.as_secs() as i32,
                 types_only: false,
                 filter,
                 attributes: attrs,
@@ -1000,6 +1015,7 @@ impl Client {
                     .tls_config(self.tls_config.clone())
                     .connect_timeout(self.connect_timeout)
                     .request_timeout(self.request_timeout)
+                    .max_message_size(self.max_message_size)
                     .referral_policy(ReferralPolicy::Follow {
                         hop_limit: hop_limit - 1,
                     });
