@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches:
+      - "main"
+    paths:
+      - ".github/workflows/ci.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "fuzz/**"
+  pull_request: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: Lint
+    strategy:
+      matrix:
+        rust-version:
+          - stable
+          - beta
+        runner:
+          - "ubuntu-22.04"
+          - "ubuntu-24.04"
+          - "ubuntu-24.04-arm"
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt, clippy
+
+      - name: Lint (clippy)
+        run: cargo clippy --all-features --workspace
+
+      - name: Lint (rustfmt)
+        run: cargo fmt --all --check
+
+  test:
+    name: Test
+    strategy:
+      matrix:
+        rust-version:
+          - stable
+          - beta
+        runner:
+          - "ubuntu-22.04"
+          - "ubuntu-24.04"
+          - "ubuntu-24.04-arm"
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run all tests
+        run: cargo nextest run --all-features --workspace
+
+  audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "ldap-client-cli"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Command-line LDAP client"
+
+[[bin]]
+name = "ldap-client"
+path = "src/main.rs"
+
+[dependencies]
+ldap-client = { path = "../ldap-client-rs", version = "0.5.0", features = ["danger-disable-verify"] }
+tokio   = { workspace = true }
+clap    = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+secrecy = { workspace = true }

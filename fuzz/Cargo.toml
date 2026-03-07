@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "ldap-client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ldap-client-ber = { path = "../crates/ldap-client-ber" }
+ldap-client-proto = { path = "../crates/ldap-client-proto" }
+
+[[bin]]
+name = "fuzz_ber_reader"
+path = "fuzz_targets/fuzz_ber_reader.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_filter_parser"
+path = "fuzz_targets/fuzz_filter_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_message_decoder"
+path = "fuzz_targets/fuzz_message_decoder.rs"
+doc = false

@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# cargo-vet audits file
+# This file records audits of third-party crates.
+# See https://mozilla.github.io/cargo-vet/ for details.
+
+[criteria.safe-to-deploy]
+description = "This crate can be compiled, run, and tested on a developer workstation or in CI without unexpected side-effects."
+
+[criteria.safe-to-run]
+description = "This crate can be compiled and run, but has not been audited for deployment."

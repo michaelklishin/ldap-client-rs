@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "ldap-client"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "Async LDAPv3 client for Rust"
+
+[lib]
+name = "ldap_client"
+
+[features]
+default = []
+danger-disable-verify = []
+integration-tests = []
+
+[dependencies]
+ldap-client-ber   = { workspace = true }
+ldap-client-proto = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls       = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots     = { workspace = true }
+secrecy      = { workspace = true }
+tracing      = { workspace = true }
+url          = { workspace = true }
+futures-util = { workspace = true }
+thiserror    = { workspace = true }
+
+[dev-dependencies]
+proptest           = { workspace = true }
+pretty_assertions  = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

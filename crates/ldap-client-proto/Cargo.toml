@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "ldap-client-proto"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "LDAPv3 wire protocol types"
+
+[dependencies]
+ldap-client-ber = { workspace = true }
+thiserror       = { workspace = true }
+
+[dev-dependencies]
+proptest           = { workspace = true }
+pretty_assertions  = { workspace = true }
+criterion          = { workspace = true }
+
+[[bench]]
+name = "filter_bench"
+harness = false

@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "ldap-client-ber"
+version.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+description = "ASN.1 BER codec for LDAP"
+
+[dependencies]
+bytes     = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+proptest           = { workspace = true }
+pretty_assertions  = { workspace = true }
+criterion          = { workspace = true }
+
+[[bench]]
+name = "ber_bench"
+harness = false
