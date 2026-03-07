@@ -452,6 +452,12 @@ fn encode_partial_attribute(w: &mut BerWriter, attr: &PartialAttribute) {
 
 // --- Decoding ---
 
+fn to_utf8(bytes: &[u8]) -> Result<String, ldap_client_ber::BerError> {
+    std::str::from_utf8(bytes)
+        .map(|s| s.to_owned())
+        .map_err(|_| ldap_client_ber::BerError::InvalidUtf8)
+}
+
 fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError> {
     if tag.class != Class::Application {
         return Err(ProtoError::Protocol(format!(
@@ -480,12 +486,12 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
             }))
         }
         APP_SEARCH_RESULT_ENTRY => {
-            let dn = String::from_utf8_lossy(r.read_octet_string()?).into_owned();
+            let dn = to_utf8(r.read_octet_string()?)?;
             let mut attributes = Vec::new();
             r.read_sequence(Tag::sequence(), |attrs| {
                 while !attrs.is_empty() {
                     attrs.read_sequence(Tag::sequence(), |attr| {
-                        let name = String::from_utf8_lossy(attr.read_octet_string()?).into_owned();
+                        let name = to_utf8(attr.read_octet_string()?)?;
                         let mut values = Vec::new();
                         attr.read_sequence(Tag::set(), |vals| {
                             while !vals.is_empty() {
@@ -511,7 +517,8 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
         APP_SEARCH_RESULT_REFERENCE => {
             let mut urls = Vec::new();
             while !r.is_empty() {
-                urls.push(String::from_utf8_lossy(r.read_octet_string()?).into_owned());
+                urls.push(to_utf8(r.read_octet_string()?)?);
+
             }
             Ok(LdapOperation::SearchResultReference(urls))
         }
@@ -543,10 +550,7 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
                 let tag = r.peek_tag()?;
                 match (tag.class, tag.number) {
                     (Class::Context, 10) => {
-                        oid = Some(
-                            String::from_utf8_lossy(r.read_tagged_implicit_octet_string(10)?)
-                                .into_owned(),
-                        );
+                        oid = Some(to_utf8(r.read_tagged_implicit_octet_string(10)?)?);
                     }
                     (Class::Context, 11) => {
                         ext_value = Some(r.read_tagged_implicit_octet_string(11)?.to_vec());
@@ -569,10 +573,7 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
                 let tag = r.peek_tag()?;
                 match (tag.class, tag.number) {
                     (Class::Context, 0) => {
-                        oid = Some(
-                            String::from_utf8_lossy(r.read_tagged_implicit_octet_string(0)?)
-                                .into_owned(),
-                        );
+                        oid = Some(to_utf8(r.read_tagged_implicit_octet_string(0)?)?);
                     }
                     (Class::Context, 1) => {
                         value = Some(r.read_tagged_implicit_octet_string(1)?.to_vec());
@@ -595,7 +596,8 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
 
 fn decode_ldap_result(r: &mut BerReader<'_>) -> Result<LdapResult, ProtoError> {
     let code = ResultCode::from_i64(r.read_enumerated()?);
-    let matched_dn = String::from_utf8_lossy(r.read_octet_string()?).into_owned();
+    let matched_dn = to_utf8(r.read_octet_string()?)?;
+    // Diagnostic messages use lossy conversion: some servers produce non-UTF-8 here.
     let diagnostic_message = String::from_utf8_lossy(r.read_octet_string()?).into_owned();
 
     let mut referral = Vec::new();
@@ -604,7 +606,8 @@ fn decode_ldap_result(r: &mut BerReader<'_>) -> Result<LdapResult, ProtoError> {
         if tag.class == Class::Context && tag.number == 3 {
             r.read_sequence(Tag::context_constructed(3), |inner| {
                 while !inner.is_empty() {
-                    referral.push(String::from_utf8_lossy(inner.read_octet_string()?).into_owned());
+                    referral.push(to_utf8(inner.read_octet_string()?)?);
+
                 }
                 Ok(())
             })?;

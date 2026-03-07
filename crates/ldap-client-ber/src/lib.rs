@@ -49,6 +49,9 @@ pub enum BerError {
     #[error("trailing data: {remaining} bytes unconsumed in constructed element")]
     TrailingData { remaining: usize },
 
+    #[error("invalid UTF-8 in string field")]
+    InvalidUtf8,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
