@@ -22,3 +22,4 @@ pub use ldap_client_proto::{
     SortKeyList, SortResult, escape_dn_value,
 };
 pub use secrecy::SecretString;
+pub use zeroize::Zeroizing;

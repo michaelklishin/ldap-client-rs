@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use ldap_client::{Client, ClientBuilder, SecretString, Transport};
+use zeroize::Zeroize;
 
 use crate::commands;
 
@@ -77,7 +78,7 @@ enum Command {
 }
 
 impl Cli {
-    pub async fn run(self) -> Result<(), ldap_client::Error> {
+    pub async fn run(mut self) -> Result<(), ldap_client::Error> {
         let client = self.connect().await?;
 
         match self.command {
@@ -93,7 +94,7 @@ impl Cli {
         }
     }
 
-    async fn connect(&self) -> Result<Client, ldap_client::Error> {
+    async fn connect(&mut self) -> Result<Client, ldap_client::Error> {
         let mut builder = if let Some(url) = &self.url {
             if self.tls || self.starttls {
                 return Err(ldap_client::Error::InvalidUrl(
@@ -137,7 +138,9 @@ impl Cli {
             if self.password.is_none() {
                 tracing::warn!("--bind-dn set without --password; binding with empty password");
             }
-            let secret = SecretString::from(self.password.clone().unwrap_or_default());
+            let mut raw = self.password.take().unwrap_or_default();
+            let secret = SecretString::from(raw.clone());
+            raw.zeroize();
             client.simple_bind(dn, &secret).await?;
             tracing::debug!(bind_dn = %dn, "bound successfully");
         }
