@@ -136,8 +136,13 @@ pub async fn upgrade_to_tls(
     stream: TcpStream,
     server_name: ServerName<'static>,
     tls_config: Arc<ClientConfig>,
+    timeout: std::time::Duration,
 ) -> Result<LdapStream, Error> {
     let connector = TlsConnector::from(tls_config);
-    let tls_stream = connector.connect(server_name, stream).await?;
+    let tls_stream = match tokio::time::timeout(timeout, connector.connect(server_name, stream)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(Error::Io(e)),
+        Err(_) => return Err(Error::Timeout),
+    };
     Ok(LdapStream::Tls(Box::new(tls_stream)))
 }

@@ -215,9 +215,9 @@ impl ClientBuilder {
                     .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
 
                 if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(tcp, server_name, tls_config.clone()).await?
+                    conn::upgrade_to_tls(tcp, server_name, tls_config.clone(), self.connect_timeout).await?
                 } else {
-                    perform_start_tls(tcp, server_name, tls_config.clone(), self.request_timeout, self.max_message_size)
+                    perform_start_tls(tcp, server_name, tls_config.clone(), self.request_timeout, self.max_message_size, self.connect_timeout)
                         .await?
                 }
             }
@@ -254,6 +254,7 @@ async fn perform_start_tls(
     tls_config: Arc<ClientConfig>,
     timeout: Duration,
     max_message_size: u32,
+    tls_timeout: Duration,
 ) -> Result<LdapStream, Error> {
     let mut framed = Framed::new(tcp, LdapCodec::new().with_max_message_size(max_message_size));
 
@@ -289,7 +290,7 @@ async fn perform_start_tls(
         ));
     }
     let tcp = parts.io;
-    conn::upgrade_to_tls(tcp, server_name, tls_config).await
+    conn::upgrade_to_tls(tcp, server_name, tls_config, tls_timeout).await
 }
 
 type FramedLdap = Framed<LdapStream, LdapCodec>;
@@ -367,7 +368,7 @@ impl Client {
                     .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
 
                 if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(tcp, server_name, self.tls_config.clone()).await?
+                    conn::upgrade_to_tls(tcp, server_name, self.tls_config.clone(), self.connect_timeout).await?
                 } else {
                     perform_start_tls(
                         tcp,
@@ -375,6 +376,7 @@ impl Client {
                         self.tls_config.clone(),
                         self.request_timeout,
                         self.max_message_size,
+                        self.connect_timeout,
                     )
                     .await?
                 }
