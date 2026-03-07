@@ -13,6 +13,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 ldap-client-ber = { path = "../crates/ldap-client-ber" }
 ldap-client-proto = { path = "../crates/ldap-client-proto" }
+zeroize = "1"
 
 [[bin]]
 name = "fuzz_ber_reader"
@@ -27,4 +28,9 @@ doc = false
 [[bin]]
 name = "fuzz_message_decoder"
 path = "fuzz_targets/fuzz_message_decoder.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_bind_roundtrip"
+path = "fuzz_targets/fuzz_bind_roundtrip.rs"
 doc = false
