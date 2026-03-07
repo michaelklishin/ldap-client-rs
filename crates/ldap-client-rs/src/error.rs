@@ -46,6 +46,9 @@ pub enum Error {
 
     #[error("referral hop limit exceeded")]
     ReferralHopLimitExceeded,
+
+    #[error("search result entry limit exceeded ({0})")]
+    SearchEntryLimitExceeded(usize),
 }
 
 impl Error {

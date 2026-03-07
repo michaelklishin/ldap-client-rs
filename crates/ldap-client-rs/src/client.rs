@@ -27,6 +27,7 @@ use crate::conn::{self, LdapStream};
 const STARTTLS_OID: &str = "1.3.6.1.4.1.1466.20037";
 const NOTICE_OF_DISCONNECTION_OID: &str = "1.3.6.1.4.1.1466.20036";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_SEARCH_ENTRIES: usize = 500_000;
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -913,11 +914,12 @@ impl Client {
         filter: Filter,
         attr: &str,
     ) -> Result<Vec<Vec<u8>>, Error> {
+        const MAX_RANGE_ROUNDS: usize = 100_000;
         let resolved_base = self.resolve_base_dn(base_dn.to_string());
         let mut all_values: Vec<Vec<u8>> = Vec::new();
         let mut range_start: u32 = 0;
 
-        loop {
+        for _ in 0..MAX_RANGE_ROUNDS {
             let range_attr = format!("{attr};range={range_start}-*");
             let entries = self
                 .search(
@@ -1193,6 +1195,9 @@ async fn collect_search_results(
         let response = recv_msg(framed, timeout, connected).await?;
         match response.operation {
             LdapOperation::SearchResultEntry(entry) => {
+                if entries.len() >= MAX_SEARCH_ENTRIES {
+                    return Err(Error::SearchEntryLimitExceeded(MAX_SEARCH_ENTRIES));
+                }
                 entries.push(entry);
             }
             LdapOperation::SearchResultDone(result) => {
