@@ -237,6 +237,7 @@ impl ClientBuilder {
             max_message_size: self.max_message_size,
             base_dn: self.base_dn,
             referral_policy: self.referral_policy,
+            last_reconnect: Mutex::new(None),
             host: self.host,
             port: self.port,
             transport: self.transport,
@@ -295,6 +296,8 @@ async fn perform_start_tls(
 
 type FramedLdap = Framed<LdapStream, LdapCodec>;
 
+const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct Client {
     framed: Mutex<FramedLdap>,
     next_id: AtomicI32,
@@ -303,6 +306,7 @@ pub struct Client {
     max_message_size: u32,
     base_dn: Option<String>,
     referral_policy: ReferralPolicy,
+    last_reconnect: Mutex<Option<tokio::time::Instant>>,
     // Fields stored for reconnect.
     host: String,
     port: u16,
@@ -350,6 +354,17 @@ impl Client {
     }
 
     pub async fn reconnect(&self) -> Result<(), Error> {
+        {
+            let mut last = self.last_reconnect.lock().await;
+            if let Some(prev) = *last {
+                let elapsed = prev.elapsed();
+                if elapsed < MIN_RECONNECT_INTERVAL {
+                    tokio::time::sleep(MIN_RECONNECT_INTERVAL - elapsed).await;
+                }
+            }
+            *last = Some(tokio::time::Instant::now());
+        }
+
         let addr = format_addr(&self.host, self.port);
         debug!(addr = %addr, transport = ?self.transport, "reconnecting");
 
