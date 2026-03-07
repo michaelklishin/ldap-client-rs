@@ -13,7 +13,7 @@ fn bind_request_simple_encode() {
         operation: LdapOperation::BindRequest(BindRequest {
             version: 3,
             name: "cn=admin,dc=example,dc=com".into(),
-            authentication: BindAuthentication::Simple(b"secret".to_vec()),
+            authentication: BindAuthentication::Simple(zeroize::Zeroizing::new(b"secret".to_vec())),
         }),
         controls: vec![],
     };
@@ -207,7 +207,7 @@ fn bind_request_sasl_encode() {
             name: String::new(),
             authentication: BindAuthentication::Sasl {
                 mechanism: "PLAIN".into(),
-                credentials: Some(b"\0user\0pass".to_vec()),
+                credentials: Some(zeroize::Zeroizing::new(b"\0user\0pass".to_vec())),
             },
         }),
         controls: vec![],

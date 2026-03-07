@@ -430,9 +430,9 @@ impl Client {
         let op = LdapOperation::BindRequest(BindRequest {
             version: 3,
             name: dn.into(),
-            authentication: BindAuthentication::Simple(
+            authentication: BindAuthentication::Simple(zeroize::Zeroizing::new(
                 password.expose_secret().as_bytes().to_vec(),
-            ),
+            )),
         });
 
         let response = self.request(op).await?;

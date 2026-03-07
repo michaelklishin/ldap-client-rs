@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::fmt;
+
 use ldap_client_ber::tag::Tag;
 use ldap_client_ber::{BerReader, BerWriter, Class};
+use zeroize::Zeroizing;
 
 use crate::ProtoError;
 use crate::controls::Control;
@@ -77,13 +80,26 @@ pub struct BindRequest {
     pub authentication: BindAuthentication,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BindAuthentication {
-    Simple(Vec<u8>),
+    Simple(Zeroizing<Vec<u8>>),
     Sasl {
         mechanism: String,
-        credentials: Option<Vec<u8>>,
+        credentials: Option<Zeroizing<Vec<u8>>>,
     },
+}
+
+impl fmt::Debug for BindAuthentication {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Simple(_) => f.debug_tuple("Simple").field(&"[REDACTED]").finish(),
+            Self::Sasl { mechanism, .. } => f
+                .debug_struct("Sasl")
+                .field("mechanism", mechanism)
+                .field("credentials", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

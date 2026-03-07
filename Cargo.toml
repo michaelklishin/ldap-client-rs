@@ -33,6 +33,7 @@ rustls      = "0.23"
 rustls-pki-types = "1"
 webpki-roots = "1"
 secrecy     = { version = "0.10", features = ["serde"] }
+zeroize     = "1"
 tracing     = "0.1"
 url         = "2"
 futures-util = { version = "0.3", features = ["sink"] }

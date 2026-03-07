@@ -14,6 +14,7 @@ description = "LDAPv3 wire protocol types"
 [dependencies]
 ldap-client-ber = { workspace = true }
 thiserror       = { workspace = true }
+zeroize         = { workspace = true }
 
 [dev-dependencies]
 proptest           = { workspace = true }
