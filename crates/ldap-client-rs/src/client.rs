@@ -1014,6 +1014,10 @@ impl Client {
                 LdapScheme::Ldap => Transport::Plain,
                 LdapScheme::Ldaps => Transport::Tls,
             };
+            if self.transport != Transport::Plain && transport == Transport::Plain {
+                debug!(url = %raw_url, "skipping referral that would downgrade from TLS to plain");
+                continue;
+            }
             let mut builder =
                 ClientBuilder::new(referral_url.host.clone(), referral_url.effective_port())
                     .transport(transport)
