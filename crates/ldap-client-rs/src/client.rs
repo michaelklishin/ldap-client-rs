@@ -445,6 +445,9 @@ impl Client {
         dn: impl Into<String>,
         password: &SecretString,
     ) -> Result<(), Error> {
+        if self.transport == Transport::Plain {
+            tracing::warn!("simple bind over plain (unencrypted) connection; credentials are sent in cleartext");
+        }
         let op = LdapOperation::BindRequest(BindRequest {
             version: 3,
             name: dn.into(),
