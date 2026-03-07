@@ -590,8 +590,15 @@ fn parse_extensible_match(input: &str) -> Result<(Filter, &str), ProtoError> {
     ))
 }
 
+const MAX_SUBSTRING_PARTS: usize = 64;
+
 fn parse_substring(attr: &str, raw_value: &str) -> Result<Filter, ProtoError> {
     let parts: Vec<&str> = raw_value.split('*').collect();
+    if parts.len() > MAX_SUBSTRING_PARTS {
+        return Err(ProtoError::FilterParse(
+            "substring filter has too many wildcard parts".into(),
+        ));
+    }
     let initial = if !parts[0].is_empty() {
         Some(unescape_value(parts[0])?)
     } else {
