@@ -1,6 +1,6 @@
 # ldap-client-rs Change Log
 
-## v0.6.0 (in development)
+## v0.6.0 (Mar 7, 2026)
 
 ### Enhancements
 
