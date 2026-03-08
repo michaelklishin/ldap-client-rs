@@ -16,9 +16,10 @@ use tracing::debug;
 use ldap_client_ber::LdapCodec;
 use ldap_client_proto::{
     AddRequest, BindAuthentication, BindRequest, CompareRequest, Control, DerefAliases,
-    ExtendedRequest, Filter, LdapMessage, LdapOperation, LdapResult as ProtoLdapResult, LdapScheme,
-    LdapUrl, MessageId, ModifyDnRequest, ModifyRequest, PAGED_RESULTS_OID, PagedResultsControl,
-    ResultCode, SearchRequest, SearchResultEntry, SearchScope,
+    ExtendedRequest, ExtendedResponse, Filter, LdapMessage, LdapOperation,
+    LdapResult as ProtoLdapResult, LdapScheme, LdapUrl, MessageId, ModifyDnRequest, ModifyRequest,
+    PAGED_RESULTS_OID, PagedResultsControl, ResultCode, SearchRequest, SearchResultEntry,
+    SearchScope,
 };
 
 use crate::Error;
@@ -29,6 +30,18 @@ const NOTICE_OF_DISCONNECTION_OID: &str = "1.3.6.1.4.1.1466.20036";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_MESSAGE_SIZE: u32 = 10 * 1024 * 1024;
 const MAX_SEARCH_ENTRIES: usize = 500_000;
+
+/// Handler for unsolicited notifications other than Notice of Disconnection.
+pub type UnsolicitedHandler = Arc<dyn Fn(&ExtendedResponse) + Send + Sync>;
+
+fn default_unsolicited_handler() -> UnsolicitedHandler {
+    Arc::new(|resp| {
+        tracing::debug!(
+            oid = resp.oid.as_deref().unwrap_or("<none>"),
+            "received unsolicited notification from server"
+        );
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -88,6 +101,7 @@ pub struct ClientBuilder {
     service_account_dn: Option<String>,
     service_account_password: Option<SecretString>,
     referral_policy: ReferralPolicy,
+    unsolicited_handler: UnsolicitedHandler,
 }
 
 impl ClientBuilder {
@@ -104,6 +118,7 @@ impl ClientBuilder {
             service_account_dn: None,
             service_account_password: None,
             referral_policy: ReferralPolicy::default(),
+            unsolicited_handler: default_unsolicited_handler(),
         }
     }
 
@@ -128,6 +143,7 @@ impl ClientBuilder {
             service_account_dn: None,
             service_account_password: None,
             referral_policy: ReferralPolicy::default(),
+            unsolicited_handler: default_unsolicited_handler(),
         })
     }
 
@@ -191,6 +207,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a callback for unsolicited notifications (message-id 0) other
+    /// than the Notice of Disconnection. The default handler logs the event at
+    /// `debug` level.
+    pub fn on_unsolicited_notification(
+        mut self,
+        handler: impl Fn(&ExtendedResponse) + Send + Sync + 'static,
+    ) -> Self {
+        self.unsolicited_handler = Arc::new(handler);
+        self
+    }
+
     pub async fn connect(self) -> Result<Client, Error> {
         let addr = format_addr(&self.host, self.port);
         debug!(addr = %addr, transport = ?self.transport, "connecting");
@@ -215,10 +242,18 @@ impl ClientBuilder {
                     .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
 
                 if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(tcp, server_name, tls_config.clone(), self.connect_timeout).await?
-                } else {
-                    perform_start_tls(tcp, server_name, tls_config.clone(), self.request_timeout, self.max_message_size, self.connect_timeout)
+                    conn::upgrade_to_tls(tcp, server_name, tls_config.clone(), self.connect_timeout)
                         .await?
+                } else {
+                    perform_start_tls(
+                        tcp,
+                        server_name,
+                        tls_config.clone(),
+                        self.request_timeout,
+                        self.max_message_size,
+                        self.connect_timeout,
+                    )
+                    .await?
                 }
             }
         };
@@ -238,6 +273,7 @@ impl ClientBuilder {
             base_dn: self.base_dn,
             referral_policy: self.referral_policy,
             last_reconnect: Mutex::new(None),
+            unsolicited_handler: self.unsolicited_handler,
             host: self.host,
             port: self.port,
             transport: self.transport,
@@ -257,7 +293,10 @@ async fn perform_start_tls(
     max_message_size: u32,
     tls_timeout: Duration,
 ) -> Result<LdapStream, Error> {
-    let mut framed = Framed::new(tcp, LdapCodec::new().with_max_message_size(max_message_size));
+    let mut framed = Framed::new(
+        tcp,
+        LdapCodec::new().with_max_message_size(max_message_size),
+    );
 
     let msg = LdapMessage {
         message_id: MessageId(1),
@@ -307,6 +346,7 @@ pub struct Client {
     base_dn: Option<String>,
     referral_policy: ReferralPolicy,
     last_reconnect: Mutex<Option<tokio::time::Instant>>,
+    unsolicited_handler: UnsolicitedHandler,
     // Fields stored for reconnect.
     host: String,
     port: u16,
@@ -383,7 +423,13 @@ impl Client {
                     .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
 
                 if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(tcp, server_name, self.tls_config.clone(), self.connect_timeout).await?
+                    conn::upgrade_to_tls(
+                        tcp,
+                        server_name,
+                        self.tls_config.clone(),
+                        self.connect_timeout,
+                    )
+                    .await?
                 } else {
                     perform_start_tls(
                         tcp,
@@ -405,7 +451,10 @@ impl Client {
         };
 
         let mut framed = self.framed.lock().await;
-        *framed = Framed::new(stream, LdapCodec::new().with_max_message_size(self.max_message_size));
+        *framed = Framed::new(
+            stream,
+            LdapCodec::new().with_max_message_size(self.max_message_size),
+        );
         self.next_id.store(start_id, Ordering::Relaxed);
         self.connected.store(true, Ordering::Relaxed);
         drop(framed);
@@ -452,7 +501,13 @@ impl Client {
 
         let mut framed = self.framed.lock().await;
         send_msg(&mut framed, data, &self.connected).await?;
-        recv_msg(&mut framed, self.request_timeout, &self.connected).await
+        recv_msg(
+            &mut framed,
+            self.request_timeout,
+            &self.connected,
+            &self.unsolicited_handler,
+        )
+        .await
     }
 
     pub async fn simple_bind(
@@ -461,7 +516,9 @@ impl Client {
         password: &SecretString,
     ) -> Result<(), Error> {
         if self.transport == Transport::Plain {
-            tracing::warn!("simple bind over plain (unencrypted) connection; credentials are sent in cleartext");
+            tracing::warn!(
+                "simple bind over plain (unencrypted) connection; credentials are sent in cleartext"
+            );
         }
         let op = LdapOperation::BindRequest(BindRequest {
             version: 3,
@@ -526,6 +583,7 @@ impl Client {
             &self.connected,
             &mut entries,
             self.referral_policy,
+            &self.unsolicited_handler,
         )
         .await?;
 
@@ -567,6 +625,7 @@ impl Client {
             &self.connected,
             &mut entries,
             self.referral_policy,
+            &self.unsolicited_handler,
         )
         .await?;
 
@@ -622,6 +681,7 @@ impl Client {
                 &self.connected,
                 &mut all_entries,
                 self.referral_policy,
+                &self.unsolicited_handler,
             )
             .await?;
 
@@ -886,6 +946,7 @@ impl Client {
             &self.connected,
             &mut entries,
             self.referral_policy,
+            &self.unsolicited_handler,
         )
         .await;
 
@@ -1043,6 +1104,7 @@ impl Client {
                     .referral_policy(ReferralPolicy::Follow {
                         hop_limit: hop_limit - 1,
                     });
+            builder.unsolicited_handler = self.unsolicited_handler.clone();
             if let Some(dn) = &self.service_account_dn
                 && let Some(pw) = &self.service_account_password
             {
@@ -1147,6 +1209,7 @@ impl<'a> PagedSearch<'a> {
             &self.client.connected,
             &mut entries,
             self.client.referral_policy,
+            &self.client.unsolicited_handler,
         )
         .await?;
 
@@ -1205,6 +1268,7 @@ impl<'a> PagedSearch<'a> {
             &self.client.connected,
             &mut entries,
             self.client.referral_policy,
+            &self.client.unsolicited_handler,
         )
         .await?;
 
@@ -1229,10 +1293,11 @@ async fn collect_search_results(
     connected: &AtomicBool,
     entries: &mut Vec<SearchResultEntry>,
     referral_policy: ReferralPolicy,
+    unsolicited_handler: &UnsolicitedHandler,
 ) -> Result<CollectedSearch, Error> {
     let mut referral_urls = Vec::new();
     loop {
-        let response = recv_msg(framed, timeout, connected).await?;
+        let response = recv_msg(framed, timeout, connected, unsolicited_handler).await?;
         match response.operation {
             LdapOperation::SearchResultEntry(entry) => {
                 if entries.len() >= MAX_SEARCH_ENTRIES {
@@ -1274,6 +1339,7 @@ async fn recv_msg(
     framed: &mut FramedLdap,
     timeout: Duration,
     connected: &AtomicBool,
+    unsolicited_handler: &UnsolicitedHandler,
 ) -> Result<LdapMessage, Error> {
     loop {
         let msg = match tokio::time::timeout(timeout, framed.next()).await {
@@ -1294,15 +1360,15 @@ async fn recv_msg(
             }
         };
 
-        // Skip unsolicited notifications (message_id == 0).
+        // Handle unsolicited notifications (message_id == 0).
         if msg.message_id == MessageId(0) {
-            if let LdapOperation::ExtendedResponse(ref resp) = msg.operation
-                && resp.oid.as_deref() == Some(NOTICE_OF_DISCONNECTION_OID)
-            {
-                connected.store(false, Ordering::Relaxed);
-                return Err(Error::ConnectionClosed);
+            if let LdapOperation::ExtendedResponse(ref resp) = msg.operation {
+                if resp.oid.as_deref() == Some(NOTICE_OF_DISCONNECTION_OID) {
+                    connected.store(false, Ordering::Relaxed);
+                    return Err(Error::ConnectionClosed);
+                }
+                unsolicited_handler(resp);
             }
-            // Other unsolicited notifications are silently skipped.
             continue;
         }
 

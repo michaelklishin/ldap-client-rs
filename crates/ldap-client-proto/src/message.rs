@@ -518,7 +518,6 @@ fn decode_operation(tag: Tag, value: &[u8]) -> Result<LdapOperation, ProtoError>
             let mut urls = Vec::new();
             while !r.is_empty() {
                 urls.push(to_utf8(r.read_octet_string()?)?);
-
             }
             Ok(LdapOperation::SearchResultReference(urls))
         }
@@ -607,7 +606,6 @@ fn decode_ldap_result(r: &mut BerReader<'_>) -> Result<LdapResult, ProtoError> {
             r.read_sequence(Tag::context_constructed(3), |inner| {
                 while !inner.is_empty() {
                     referral.push(to_utf8(inner.read_octet_string()?)?);
-
                 }
                 Ok(())
             })?;
