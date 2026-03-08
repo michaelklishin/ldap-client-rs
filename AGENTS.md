@@ -72,11 +72,14 @@ To produce a new release:
  1. Update the changelog: replace `(in development)` with today's date, e.g. `(Feb 20, 2026)`. Make sure all notable changes since the previous release are listed
  2. Commit with the message `0.N.0` (just the version number, nothing else)
  3. Tag the commit: `git tag v0.N.0`
- 4. Publish to crates.io: check out the tag, then publish the crates in dependency order: `cargo publish -p ldap-client-ber --all-features`, then `ldap-client-proto`, then `ldap-client`, then `ldap-client-cli`
- 5. Bump the dev version: back on `main`, set `Cargo.toml` workspace version to `0.(N+1).0` and update the version in `[workspace.dependencies]` and `crates/ldap-client-cli/Cargo.toml`
- 6. Add a new `## v0.(N+1).0 (in development)` section to `CHANGELOG.md` with `No changes yet.` underneath
- 7. Commit with the message `Bump dev version`
- 8. Push: `git push && git push --tags`
+ 4. Bump the dev version: back on `main`, set `Cargo.toml` workspace version to `0.(N+1).0` and update the version in `[workspace.dependencies]` and `crates/ldap-client-cli/Cargo.toml`
+ 5. Add a new `## v0.(N+1).0 (in development)` section to `CHANGELOG.md` with `No changes yet.` underneath
+ 6. Commit with the message `Bump dev version`
+ 7. Push: `git push && git push --tags`
+
+The tag push triggers `.github/workflows/release.yml`, which publishes the crates to crates.io
+via Trusted Publishing (OIDC) and creates a GitHub Release with changelog notes. No manual
+`cargo publish` needed.
 
 ## Git Commits
 
