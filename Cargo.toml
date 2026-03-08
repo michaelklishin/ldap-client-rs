@@ -11,7 +11,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 authors = ["Michael S. Klishin and Contributors"]
 rust-version = "1.93"
 edition = "2024"
@@ -20,9 +20,9 @@ homepage = "https://github.com/michaelklishin/ldap-client-rs"
 repository = "https://github.com/michaelklishin/ldap-client-rs"
 
 [workspace.dependencies]
-ldap-client-ber   = { path = "./crates/ldap-client-ber",   version = "0.6.0" }
-ldap-client-proto = { path = "./crates/ldap-client-proto", version = "0.6.0" }
-ldap-client-rs    = { path = "./crates/ldap-client-rs",    version = "0.6.0" }
+ldap-client-ber   = { path = "./crates/ldap-client-ber",   version = "0.7.0" }
+ldap-client-proto = { path = "./crates/ldap-client-proto", version = "0.7.0" }
+ldap-client-rs    = { path = "./crates/ldap-client-rs",    version = "0.7.0" }
 
 bytes       = "1"
 thiserror   = "2"
