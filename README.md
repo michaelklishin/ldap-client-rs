@@ -24,7 +24,7 @@ This library is young. Before `1.0`, breaking API changes are possible.
 ## Dependency
 
 ```toml
-ldap-client = "0.1"
+ldap-client = "0.5"
 ```
 
 
@@ -180,6 +180,40 @@ use ldap_client::{ClientBuilder, Transport};
 
 let client = ClientBuilder::new("ldap.example.com", 389)
     .transport(Transport::StartTls)
+    .connect().await?;
+```
+
+### Custom TLS Configuration
+
+```rust
+use ldap_client::{ClientBuilder, TlsConfig, TlsVersion, Transport};
+
+let client = ClientBuilder::new("ldap.example.com", 636)
+    .transport(Transport::Tls)
+    .tls(TlsConfig {
+        min_tls_version: TlsVersion::Tls12,
+        ..Default::default()
+    })?
+    .connect().await?;
+```
+
+### Who Am I
+
+```rust
+if let Some(authz_id) = client.who_am_i().await? {
+    println!("bound as {authz_id}");
+}
+```
+
+### Unsolicited Notification Handler
+
+```rust
+use ldap_client::ClientBuilder;
+
+let client = ClientBuilder::new("ldap.example.com", 389)
+    .on_unsolicited_notification(|resp| {
+        eprintln!("server notification: {:?}", resp.oid);
+    })
     .connect().await?;
 ```
 
