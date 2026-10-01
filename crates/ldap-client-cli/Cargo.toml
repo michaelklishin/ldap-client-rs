@@ -16,10 +16,9 @@ name = "ldap-client"
 path = "src/main.rs"
 
 [dependencies]
-ldap-client = { path = "../ldap-client-rs", version = "0.7.0", features = ["danger-disable-verify"] }
+ldap-client = { path = "../ldap-client-rs", version = "0.8.0", features = ["danger-disable-verify"] }
 tokio   = { workspace = true }
 clap    = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 secrecy = { workspace = true }
-zeroize = { workspace = true }

@@ -1,0 +1,8 @@
+error[E0639]: cannot create non-exhaustive struct using struct expression
+ --> tests/compile_fail/tls_config_literal.rs:4:13
+  |
+4 |       let _ = TlsConfig {
+  |  _____________^
+5 | |         ..TlsConfig::default()
+6 | |     };
+  | |_____^

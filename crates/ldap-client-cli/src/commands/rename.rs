@@ -3,6 +3,8 @@
 use clap::Args;
 use ldap_client::{Client, Dn};
 
+use crate::error::CliError;
+
 #[derive(Args)]
 pub struct RenameArgs {
     /// DN of the entry to rename
@@ -22,21 +24,13 @@ pub struct RenameArgs {
     new_superior: Option<String>,
 }
 
-pub async fn run(client: &Client, args: RenameArgs) -> Result<(), ldap_client::Error> {
+pub async fn run(client: &Client, args: RenameArgs) -> Result<(), CliError> {
     let parent = match &args.new_superior {
-        Some(sup) => sup.clone(),
-        None => {
-            // Parse the DN properly to handle escaped commas.
-            let parsed = Dn::parse(&args.dn).unwrap_or_else(|_| Dn { rdns: Vec::new() });
-            if parsed.rdns.len() > 1 {
-                let parent_dn = Dn {
-                    rdns: parsed.rdns[1..].to_vec(),
-                };
-                parent_dn.to_string()
-            } else {
-                String::new()
-            }
-        }
+        Some(sup) => Some(sup.clone()),
+        None => Dn::parse(&args.dn)
+            .ok()
+            .and_then(|dn| dn.parent())
+            .map(|dn| dn.to_string()),
     };
     client
         .modify_dn(
@@ -46,10 +40,9 @@ pub async fn run(client: &Client, args: RenameArgs) -> Result<(), ldap_client::E
             args.new_superior,
         )
         .await?;
-    let new_dn = if parent.is_empty() {
-        args.new_rdn
-    } else {
-        format!("{},{}", args.new_rdn, parent)
+    let new_dn = match parent {
+        Some(parent) => format!("{},{}", args.new_rdn, parent),
+        None => args.new_rdn,
     };
     println!("entry renamed: {} -> {new_dn}", args.dn);
     Ok(())

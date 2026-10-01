@@ -2,9 +2,12 @@
 
 //! RFC 4514 Distinguished Name parser.
 
-use std::fmt;
+use std::fmt::{self, Write};
 
 use crate::ProtoError;
+use crate::syntax::{escape_attribute_type, hex_pair, hex_pair_at, is_attribute_type};
+
+const ESCAPABLE: &[u8] = b"\\\"+,;<>#= ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dn {
@@ -13,189 +16,240 @@ pub struct Dn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdn {
-    pub components: Vec<(String, String)>,
+    pub components: Vec<(String, AttributeValue)>,
+}
+
+/// An RDN value: text, or the BER encoding that RFC 4514 section 2.4 writes
+/// as `#` and hex digits.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AttributeValue {
+    Text(String),
+    Ber(Vec<u8>),
+}
+
+impl AttributeValue {
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Ber(_) => None,
+        }
+    }
+}
+
+impl From<&str> for AttributeValue {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<String> for AttributeValue {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl PartialEq<str> for AttributeValue {
+    fn eq(&self, other: &str) -> bool {
+        self.as_text() == Some(other)
+    }
+}
+
+impl PartialEq<&str> for AttributeValue {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_text() == Some(*other)
+    }
 }
 
 impl Dn {
     pub fn parse(input: &str) -> Result<Self, ProtoError> {
-        let input = input.trim();
+        let input = input.trim_start();
         if input.is_empty() {
             return Ok(Dn { rdns: Vec::new() });
         }
-
-        let mut rdns = Vec::new();
-        let mut remaining = input;
-        loop {
-            let (rdn, rest) = parse_rdn(remaining)?;
-            rdns.push(rdn);
-            if rest.is_empty() {
-                break;
-            }
-            if let Some(r) = rest.strip_prefix(',') {
-                remaining = r;
-            } else {
-                return Err(ProtoError::Protocol(format!(
-                    "expected ',' or end of DN, got {:?}",
-                    &rest[..rest.len().min(10)]
-                )));
-            }
-        }
-        Ok(Dn { rdns })
+        let mut parser = Parser { input, pos: 0 };
+        Ok(Dn {
+            rdns: parser.rdns()?,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
         self.rdns.is_empty()
     }
-}
 
-fn parse_rdn(input: &str) -> Result<(Rdn, &str), ProtoError> {
-    let mut components = Vec::new();
-    let mut remaining = input;
-    loop {
-        let (attr, value, rest) = parse_ava(remaining)?;
-        components.push((attr, value));
-        if let Some(r) = rest.strip_prefix('+') {
-            remaining = r;
-        } else {
-            return Ok((Rdn { components }, rest));
+    /// The DN without its first RDN, or `None` for a DN of one RDN or none.
+    pub fn parent(&self) -> Option<Dn> {
+        match self.rdns.split_first() {
+            Some((_, rest)) if !rest.is_empty() => Some(Dn {
+                rdns: rest.to_vec(),
+            }),
+            _ => None,
         }
     }
 }
 
-fn parse_ava(input: &str) -> Result<(String, String, &str), ProtoError> {
-    // Only search for '=' before any unescaped ',' or '+' (those are RDN/AVA separators).
-    let limit = find_unescaped_separator(input);
-    let eq_pos = input[..limit]
-        .find('=')
-        .ok_or_else(|| ProtoError::Protocol("expected '=' in attribute value assertion".into()))?;
-    let attr = input[..eq_pos].trim().to_string();
-    if attr.is_empty() {
-        return Err(ProtoError::Protocol("empty attribute type".into()));
-    }
-    let rest = &input[eq_pos + 1..];
-
-    if let Some(hex_rest) = rest.strip_prefix('#') {
-        // Hex-encoded BER value (RFC 4514 §2.4)
-        let end = hex_rest.find([',', '+']).unwrap_or(hex_rest.len());
-        let hex = &hex_rest[..end];
-        if hex.is_empty() || hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(ProtoError::Protocol(
-                "invalid hex-string in DN value: expected even number of hex digits after '#'"
-                    .into(),
-            ));
-        }
-        let value = format!("#{hex}");
-        Ok((attr, value, &hex_rest[end..]))
-    } else if let Some(after_quote) = rest.strip_prefix('"') {
-        // Quoted string (legacy, but we should parse it)
-        let end = after_quote
-            .find('"')
-            .ok_or_else(|| ProtoError::Protocol("unterminated quoted string in DN".into()))?;
-        let value = after_quote[..end].to_string();
-        Ok((attr, value, &after_quote[end + 1..]))
-    } else {
-        let (value, rest) = parse_dn_value(rest)?;
-        Ok((attr, value, rest))
-    }
+/// A cursor that only stops on ASCII bytes, so every index it slices the
+/// input at is a character boundary.
+struct Parser<'a> {
+    input: &'a str,
+    pos: usize,
 }
 
-fn find_unescaped_separator(input: &str) -> usize {
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b',' | b'+' => return i,
-            b'\\' => {
-                i += 1;
-                if i + 1 < bytes.len()
-                    && bytes[i].is_ascii_hexdigit()
-                    && bytes[i + 1].is_ascii_hexdigit()
-                {
-                    i += 2;
-                } else if i < bytes.len() {
-                    // Skip the full escaped character (multi-byte safe).
-                    let ch = input[i..].chars().next().unwrap();
-                    i += ch.len_utf8();
-                }
+impl Parser<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.pos).copied()
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self.peek().is_some_and(is_trailing_whitespace) {
+            self.pos += 1;
+        }
+    }
+
+    fn error_at(&self, pos: usize, what: &str) -> ProtoError {
+        ProtoError::Protocol(format!("{what} at byte {pos}"))
+    }
+
+    fn error(&self, what: &str) -> ProtoError {
+        self.error_at(self.pos, what)
+    }
+
+    fn rdns(&mut self) -> Result<Vec<Rdn>, ProtoError> {
+        let mut rdns = vec![self.rdn()?];
+        while self.peek() == Some(b',') {
+            self.pos += 1;
+            rdns.push(self.rdn()?);
+        }
+        match self.peek() {
+            None => Ok(rdns),
+            Some(_) => Err(self.error("expected ',' or end of DN")),
+        }
+    }
+
+    fn rdn(&mut self) -> Result<Rdn, ProtoError> {
+        let mut components = vec![self.ava()?];
+        while self.peek() == Some(b'+') {
+            self.pos += 1;
+            components.push(self.ava()?);
+        }
+        Ok(Rdn { components })
+    }
+
+    fn ava(&mut self) -> Result<(String, AttributeValue), ProtoError> {
+        let start = self.pos;
+        while self
+            .peek()
+            .is_some_and(|b| !matches!(b, b'=' | b',' | b'+'))
+        {
+            self.pos += 1;
+        }
+        if self.peek() != Some(b'=') {
+            return Err(self.error("expected '=' in attribute value assertion"));
+        }
+        let attr = self.input[start..self.pos].trim();
+        if attr.is_empty() {
+            return Err(self.error_at(start, "empty attribute type"));
+        }
+        if !is_attribute_type(attr) {
+            return Err(self.error_at(start, &format!("invalid attribute type {attr:?}")));
+        }
+        self.pos += 1;
+
+        let value = match self.peek() {
+            Some(b'#') => self.hex_value()?,
+            Some(b'"') => self.quoted_value()?,
+            _ => self.text_value()?,
+        };
+        Ok((attr.to_owned(), value))
+    }
+
+    fn hex_value(&mut self) -> Result<AttributeValue, ProtoError> {
+        self.pos += 1;
+        let start = self.pos;
+        while self
+            .peek()
+            .is_some_and(|b| !matches!(b, b',' | b'+') && !is_trailing_whitespace(b))
+        {
+            self.pos += 1;
+        }
+        let digits = &self.input.as_bytes()[start..self.pos];
+        let (pairs, odd) = digits.as_chunks::<2>();
+        let bytes = odd
+            .is_empty()
+            .then(|| {
+                pairs
+                    .iter()
+                    .map(|[high, low]| hex_pair(*high, *low))
+                    .collect::<Option<Vec<u8>>>()
+            })
+            .flatten();
+        match bytes {
+            Some(bytes) if !bytes.is_empty() => {
+                self.skip_whitespace();
+                Ok(AttributeValue::Ber(bytes))
             }
-            _ => i += 1,
+            _ => Err(self.error_at(
+                start,
+                "invalid hex-string in DN value: expected even number of hex digits after '#'",
+            )),
         }
     }
-    bytes.len()
-}
 
-fn parse_dn_value(input: &str) -> Result<(String, &str), ProtoError> {
-    let mut out = String::new();
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    // Track position of last non-space or escaped character for trailing-space trim.
-    // RFC 4514 §3: trailing spaces are trimmed only when unescaped.
-    let mut last_non_trimmable = 0;
+    fn quoted_value(&mut self) -> Result<AttributeValue, ProtoError> {
+        self.pos += 1;
+        let start = self.pos;
+        while self.peek().is_some_and(|b| b != b'"') {
+            self.pos += 1;
+        }
+        if self.peek().is_none() {
+            return Err(self.error_at(start, "unterminated quoted string in DN"));
+        }
+        let value = self.input[start..self.pos].to_owned();
+        self.pos += 1;
+        self.skip_whitespace();
+        Ok(AttributeValue::Text(value))
+    }
 
-    while i < bytes.len() {
-        match bytes[i] {
-            b',' | b'+' => break,
-            b'\\' => {
-                i += 1;
-                if i >= bytes.len() {
-                    break;
-                }
-                // Hex pair?
-                if i + 1 < bytes.len()
-                    && bytes[i].is_ascii_hexdigit()
-                    && bytes[i + 1].is_ascii_hexdigit()
-                    && let Ok(byte) =
-                        u8::from_str_radix(std::str::from_utf8(&bytes[i..i + 2]).unwrap_or(""), 16)
-                {
-                    // Accumulate raw bytes for multi-byte UTF-8
-                    let mut raw = vec![byte];
-                    i += 2;
-                    while i + 2 < bytes.len()
-                        && bytes[i] == b'\\'
-                        && bytes[i + 1].is_ascii_hexdigit()
-                        && bytes[i + 2].is_ascii_hexdigit()
-                    {
-                        if let Ok(b) = u8::from_str_radix(
-                            std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                            16,
-                        ) {
-                            // Only continue if this looks like a continuation byte
-                            if b & 0xC0 != 0x80 {
-                                break;
-                            }
-                            raw.push(b);
-                            i += 3;
-                        } else {
-                            break;
-                        }
+    fn text_value(&mut self) -> Result<AttributeValue, ProtoError> {
+        let bytes = self.input.as_bytes();
+        let mut out = Vec::new();
+        // Only unescaped trailing whitespace is trimmed. RFC 4514 names the space;
+        // tab, CR and LF are trimmed as well, as the surrounding `trim` used to.
+        let mut keep = 0;
+        while let Some(b) = self.peek() {
+            match b {
+                b',' | b'+' => break,
+                b'\\' => {
+                    let at = self.pos;
+                    self.pos += 1;
+                    if let Some(byte) = hex_pair_at(bytes, self.pos) {
+                        out.push(byte);
+                        self.pos += 2;
+                    } else if let Some(c) = self.peek().filter(|c| ESCAPABLE.contains(c)) {
+                        out.push(c);
+                        self.pos += 1;
+                    } else {
+                        return Err(self.error_at(at, "invalid escape in DN value"));
                     }
-                    let decoded = String::from_utf8(raw).map_err(|e| {
-                        ProtoError::Protocol(format!("invalid UTF-8 in DN value: {e}"))
-                    })?;
-                    out.push_str(&decoded);
-                    last_non_trimmable = out.len();
-                    continue;
+                    keep = out.len();
                 }
-                // Escaped special character (always ASCII per RFC 4514)
-                out.push(bytes[i] as char);
-                last_non_trimmable = out.len();
-                i += 1;
-            }
-            _ => {
-                // Decode full UTF-8 character to handle multi-byte sequences.
-                let ch = input[i..].chars().next().unwrap();
-                out.push(ch);
-                if ch != ' ' {
-                    last_non_trimmable = out.len();
+                _ => {
+                    out.push(b);
+                    self.pos += 1;
+                    if !is_trailing_whitespace(b) {
+                        keep = out.len();
+                    }
                 }
-                i += ch.len_utf8();
             }
         }
+        out.truncate(keep);
+        String::from_utf8(out)
+            .map(AttributeValue::Text)
+            .map_err(|e| ProtoError::Protocol(format!("invalid UTF-8 in DN value: {e}")))
     }
+}
 
-    // Trim unescaped trailing spaces (per RFC 4514 §3).
-    out.truncate(last_non_trimmable);
-    Ok((out, &input[i..]))
+const fn is_trailing_whitespace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 /// Escape a DN value per RFC 4514 §2.4.
@@ -211,11 +265,12 @@ pub fn escape_dn_value(value: &str) -> String {
             '#' if first => true,
             ' ' if first || is_last => true,
             '\0' => true,
+            '\t' | '\n' | '\r' if is_last => true,
             _ => false,
         };
         if needs_escape {
-            if ch == '\0' {
-                out.push_str("\\00");
+            if ch.is_ascii_control() {
+                let _ = write!(out, "\\{:02x}", ch as u8);
             } else {
                 out.push('\\');
                 out.push(ch);
@@ -240,13 +295,25 @@ impl fmt::Display for Dn {
     }
 }
 
+impl fmt::Display for AttributeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text(text) => f.write_str(&escape_dn_value(text)),
+            Self::Ber(bytes) => {
+                f.write_char('#')?;
+                bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+            }
+        }
+    }
+}
+
 impl fmt::Display for Rdn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (i, (attr, value)) in self.components.iter().enumerate() {
             if i > 0 {
                 f.write_str("+")?;
             }
-            write!(f, "{}={}", attr, escape_dn_value(value))?;
+            write!(f, "{}={value}", escape_attribute_type(attr))?;
         }
         Ok(())
     }

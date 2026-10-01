@@ -38,4 +38,6 @@ thiserror    = { workspace = true }
 [dev-dependencies]
 proptest           = { workspace = true }
 pretty_assertions  = { workspace = true }
+rcgen              = { workspace = true }
+trybuild           = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

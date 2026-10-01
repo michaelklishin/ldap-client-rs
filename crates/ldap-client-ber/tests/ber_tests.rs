@@ -472,3 +472,119 @@ fn null_encoding() {
     let bytes = w.as_bytes();
     assert_eq!(bytes, &[0x05, 0x00]);
 }
+
+// ---------- Strict primitive reads, peek and finish ----------
+
+#[test]
+fn a_constructed_integer_is_refused() {
+    let mut r = BerReader::new(&[0x22, 0x03, 0x02, 0x01, 0x05]);
+    assert!(matches!(
+        r.read_integer(),
+        Err(BerError::UnexpectedTag { .. })
+    ));
+}
+
+#[test]
+fn a_constructed_boolean_is_refused() {
+    let mut r = BerReader::new(&[0x21, 0x03, 0x01, 0x01, 0xFF]);
+    assert!(matches!(
+        r.read_boolean(),
+        Err(BerError::UnexpectedTag { .. })
+    ));
+}
+
+#[test]
+fn a_constructed_octet_string_is_refused() {
+    let mut r = BerReader::new(&[0x24, 0x00]);
+    assert!(matches!(
+        r.read_octet_string(),
+        Err(BerError::ConstructedPrimitive)
+    ));
+}
+
+#[test]
+fn read_implicit_refuses_a_constructed_element() {
+    let mut r = BerReader::new(&[0xA7, 0x00]);
+    assert!(matches!(
+        r.read_implicit(Tag::context(7)),
+        Err(BerError::UnexpectedTag { .. })
+    ));
+}
+
+#[test]
+fn read_implicit_reads_a_primitive_element() {
+    let mut r = BerReader::new(&[0x87, 0x02, b'h', b'i']);
+    assert_eq!(r.read_implicit(Tag::context(7)).unwrap(), b"hi");
+    assert!(r.is_empty());
+}
+
+#[test]
+fn peek_is_matches_the_whole_tag() {
+    let r = BerReader::new(&[0x87, 0x00]);
+    assert!(r.peek_is(Tag::context(7)));
+    assert!(!r.peek_is(Tag::context_constructed(7)));
+    assert!(!r.peek_is(Tag::context(8)));
+}
+
+#[test]
+fn peek_is_false_on_empty_input() {
+    assert!(!BerReader::new(&[]).peek_is(Tag::context(0)));
+}
+
+#[test]
+fn finish_reports_trailing_bytes() {
+    let mut r = BerReader::new(&[0x02, 0x01, 0x05, 0xFF]);
+    r.read_integer().unwrap();
+    assert!(matches!(
+        r.finish(),
+        Err(BerError::TrailingData { remaining: 1 })
+    ));
+}
+
+#[test]
+fn finish_succeeds_on_consumed_input() {
+    let mut r = BerReader::new(&[0x02, 0x01, 0x05]);
+    r.read_integer().unwrap();
+    assert!(r.finish().is_ok());
+}
+
+#[test]
+fn a_sequence_closure_can_return_a_slice_of_the_input() {
+    let input = [0x30, 0x03, 0x04, 0x01, b'x'];
+    let mut r = BerReader::new(&input);
+    let slice: &[u8] = r
+        .read_sequence(Tag::sequence(), |inner| inner.read_octet_string())
+        .unwrap();
+    assert_eq!(slice, b"x");
+}
+
+#[test]
+fn write_null_writes_the_null_tag() {
+    let mut w = BerWriter::new();
+    w.write_null();
+    assert_eq!(w.as_bytes(), &[0x05, 0x00]);
+}
+
+#[test]
+fn read_each_collects_until_the_input_is_empty() {
+    let mut w = BerWriter::new();
+    w.write_integer(1).write_integer(2).write_integer(3);
+    let mut r = BerReader::new(w.as_bytes());
+    assert_eq!(r.read_each(|r| r.read_integer()).unwrap(), vec![1, 2, 3]);
+    assert!(r.is_empty());
+}
+
+#[test]
+fn read_each_stops_at_the_first_error() {
+    let mut r = BerReader::new(&[0x02, 0x01, 0x01, 0x04, 0x00]);
+    assert!(r.read_each(|r| r.read_integer()).is_err());
+}
+
+#[test]
+fn decode_i64_bytes_mirrors_encode_i64_bytes() {
+    use ldap_client_ber::reader::decode_i64_bytes;
+    use ldap_client_ber::writer::encode_i64_bytes;
+    for value in [0, 1, 127, 128, -1, -129, i64::MAX, i64::MIN] {
+        assert_eq!(decode_i64_bytes(&encode_i64_bytes(value)).unwrap(), value);
+    }
+}

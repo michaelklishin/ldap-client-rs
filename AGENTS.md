@@ -2,7 +2,7 @@
 
 ## What is This Codebase?
 
-A modern Rust client for LDAPv3 targeting Rust `1.93+`.
+A modern Rust client for LDAPv3 targeting Rust `1.98.1+`.
 
 ## Build System
 
@@ -22,10 +22,14 @@ If compilation fails, investigate and fix compilation errors before proceeding w
 ## Key Files
 
  * `crates/ldap-client-rs/src/client.rs`: a `Client`, a `ClientBuilder`, implementations of individual LDAP operations
+ * `crates/ldap-client-rs/src/client/session.rs`: the owned connection session, `ConnectParams` and `Session::open`
+ * `crates/ldap-client-rs/src/client/operation.rs`: the `Operation` trait behind `exchange` and `execute`
+ * `crates/ldap-client-rs/src/client/search.rs`: `SearchParams`, `search_with` and `PagedSearch`
  * `crates/ldap-client-rs/src/conn.rs`: LDAP connection, TLS and STARTTLS-related parts
  * `crates/ldap-client-rs/src/error.rs`: error types
  * `crates/ldap-client-proto/src/message.rs`: LDAPv3 PDU types
  * `crates/ldap-client-proto/src/filter.rs`: RFC 4515 filter parser
+ * `crates/ldap-client-proto/src/syntax.rs`: character rules and escapes shared by the DN, filter and URL parsers
  * `crates/ldap-client-ber/src/reader.rs`: BER deserializer
  * `crates/ldap-client-ber/src/writer.rs`: BER serializer
 

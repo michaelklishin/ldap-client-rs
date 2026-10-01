@@ -1,35 +1,35 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod operation;
+mod search;
+mod session;
+
+use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
 use rustls::ClientConfig;
-use rustls_pki_types::ServerName;
 use secrecy::{ExposeSecret, SecretString};
-use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio_util::codec::Framed;
 use tracing::debug;
+use zeroize::Zeroizing;
 
-use ldap_client_ber::LdapCodec;
 use ldap_client_proto::{
-    AddRequest, BindAuthentication, BindRequest, CompareRequest, Control, DerefAliases,
-    ExtendedRequest, ExtendedResponse, Filter, LdapMessage, LdapOperation,
-    LdapResult as ProtoLdapResult, LdapScheme, LdapUrl, MessageId, ModifyDnRequest, ModifyRequest,
-    PAGED_RESULTS_OID, PagedResultsControl, ResultCode, SearchRequest, SearchResultEntry,
-    SearchScope,
+    AddRequest, BindAuthentication, BindRequest, CompareRequest, Control, ExtendedRequest,
+    ExtendedResponse, Filter, HasLdapResult, LdapScheme, LdapUrl, ModifyDnRequest, ModifyRequest,
+    ProtoError, STARTTLS_OID, SearchResultEntry, SearchScope, WHO_AM_I_OID,
 };
 
 use crate::Error;
-use crate::conn::{self, LdapStream};
+use crate::tls_config::default_client_config;
+use operation::{Delete, Operation};
+pub use search::{PagedSearch, SearchParams};
+use session::{ConnectParams, Security, Session, TransportError};
 
-const STARTTLS_OID: &str = "1.3.6.1.4.1.1466.20037";
-const NOTICE_OF_DISCONNECTION_OID: &str = "1.3.6.1.4.1.1466.20036";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_MAX_MESSAGE_SIZE: u32 = 10 * 1024 * 1024;
 const MAX_SEARCH_ENTRIES: usize = 500_000;
+const SEARCH_ONE_SIZE_LIMIT: NonZeroU32 = NonZeroU32::new(2).unwrap();
 
 /// Handler for unsolicited notifications other than Notice of Disconnection.
 pub type UnsolicitedHandler = Arc<dyn Fn(&ExtendedResponse) + Send + Sync>;
@@ -57,10 +57,35 @@ pub enum Transport {
     StartTls,
 }
 
+impl Transport {
+    /// StartTLS runs on the plain port.
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Self::Plain | Self::StartTls => LdapScheme::Ldap.default_port(),
+            Self::Tls => LdapScheme::Ldaps.default_port(),
+        }
+    }
+}
+
+impl From<LdapScheme> for Transport {
+    fn from(scheme: LdapScheme) -> Self {
+        match scheme {
+            LdapScheme::Ldap => Self::Plain,
+            LdapScheme::Ldaps => Self::Tls,
+        }
+    }
+}
+
 /// Controls how the server's referral responses are handled.
+///
+/// In a search, a referral is listed in `SearchResult::referrals` under
+/// `Ignore` and returned as `Error::Referral` under the other two policies;
+/// it is never followed. For any other operation, a referral means the
+/// server did not perform it, so it is returned as `Error::Referral` unless
+/// the policy is `Follow`. A bind is never followed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReferralPolicy {
-    /// Silently ignore referrals (treat as success).
+    /// List referrals in search results and return them as errors otherwise.
     #[default]
     Ignore,
     /// Return referrals as `Error::Referral` to the caller.
@@ -76,6 +101,18 @@ impl ReferralPolicy {
     }
 }
 
+/// What a connection opened to follow a referral binds as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReferralCredentials {
+    /// No bind: the referred operation is the first request.
+    #[default]
+    Anonymous,
+    /// Bind with the client's service account. The referral names the host,
+    /// so this sends the service account's password where the server says.
+    ServiceAccount,
+}
+
 /// Credentials for [`Client::bind`].
 pub enum BindCredentials<'a> {
     /// Simple bind with a DN and password.
@@ -89,6 +126,21 @@ pub enum BindCredentials<'a> {
     SaslExternal,
 }
 
+#[derive(Clone)]
+struct ServiceAccount {
+    dn: String,
+    password: SecretString,
+}
+
+/// What a client does with a connection, as opposed to how it connects.
+struct Settings {
+    base_dn: Option<String>,
+    service_account: Option<ServiceAccount>,
+    referral_policy: ReferralPolicy,
+    referral_credentials: ReferralCredentials,
+    unsolicited_handler: UnsolicitedHandler,
+}
+
 pub struct ClientBuilder {
     host: String,
     port: u16,
@@ -97,11 +149,7 @@ pub struct ClientBuilder {
     connect_timeout: Duration,
     request_timeout: Duration,
     max_message_size: u32,
-    base_dn: Option<String>,
-    service_account_dn: Option<String>,
-    service_account_password: Option<SecretString>,
-    referral_policy: ReferralPolicy,
-    unsolicited_handler: UnsolicitedHandler,
+    settings: Settings,
 }
 
 impl ClientBuilder {
@@ -114,37 +162,23 @@ impl ClientBuilder {
             connect_timeout: DEFAULT_TIMEOUT,
             request_timeout: DEFAULT_TIMEOUT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            base_dn: None,
-            service_account_dn: None,
-            service_account_password: None,
-            referral_policy: ReferralPolicy::default(),
-            unsolicited_handler: default_unsolicited_handler(),
+            settings: Settings {
+                base_dn: None,
+                service_account: None,
+                referral_policy: ReferralPolicy::default(),
+                referral_credentials: ReferralCredentials::default(),
+                unsolicited_handler: default_unsolicited_handler(),
+            },
         }
     }
 
     pub fn from_url(url: &str) -> Result<Self, Error> {
         let parsed = LdapUrl::parse(url).map_err(|e| Error::InvalidUrl(format!("{e}")))?;
 
-        let transport = match parsed.scheme {
-            LdapScheme::Ldap => Transport::Plain,
-            LdapScheme::Ldaps => Transport::Tls,
-        };
-
         let port = parsed.effective_port();
-        Ok(Self {
-            host: parsed.host,
-            port,
-            transport,
-            tls_config: None,
-            connect_timeout: DEFAULT_TIMEOUT,
-            request_timeout: DEFAULT_TIMEOUT,
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            base_dn: parsed.base_dn,
-            service_account_dn: None,
-            service_account_password: None,
-            referral_policy: ReferralPolicy::default(),
-            unsolicited_handler: default_unsolicited_handler(),
-        })
+        let mut builder = Self::new(parsed.host, port).transport(Transport::from(parsed.scheme));
+        builder.settings.base_dn = parsed.base_dn;
+        Ok(builder)
     }
 
     pub fn transport(mut self, transport: Transport) -> Self {
@@ -186,18 +220,30 @@ impl ClientBuilder {
     }
 
     pub fn base_dn(mut self, base_dn: impl Into<String>) -> Self {
-        self.base_dn = Some(base_dn.into());
+        self.settings.base_dn = Some(base_dn.into());
         self
     }
 
+    /// Set the service account that [`Client::rebind_service_account`] and
+    /// [`Client::reconnect`] bind with. A DN with an empty password is refused
+    /// by [`connect`](Self::connect) as `Error::UnauthenticatedBind`.
     pub fn service_account(mut self, dn: impl Into<String>, password: SecretString) -> Self {
-        self.service_account_dn = Some(dn.into());
-        self.service_account_password = Some(password);
+        self.settings.service_account = Some(ServiceAccount {
+            dn: dn.into(),
+            password,
+        });
         self
     }
 
     pub fn referral_policy(mut self, policy: ReferralPolicy) -> Self {
-        self.referral_policy = policy;
+        self.settings.referral_policy = policy;
+        self
+    }
+
+    /// Choose what a connection opened to follow a referral binds as
+    /// (anonymous by default).
+    pub fn referral_credentials(mut self, credentials: ReferralCredentials) -> Self {
+        self.settings.referral_credentials = credentials;
         self
     }
 
@@ -214,185 +260,136 @@ impl ClientBuilder {
         mut self,
         handler: impl Fn(&ExtendedResponse) + Send + Sync + 'static,
     ) -> Self {
-        self.unsolicited_handler = Arc::new(handler);
+        self.settings.unsolicited_handler = Arc::new(handler);
         self
     }
 
     pub async fn connect(self) -> Result<Client, Error> {
-        let addr = format_addr(&self.host, self.port);
-        debug!(addr = %addr, transport = ?self.transport, "connecting");
+        if let Some(account) = &self.settings.service_account {
+            simple_bind_request(account.dn.clone(), &account.password)?;
+        }
 
-        let tcp = match tokio::time::timeout(self.connect_timeout, TcpStream::connect(&addr)).await
-        {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(e)) => return Err(Error::Io(e)),
-            Err(_) => return Err(Error::Timeout),
-        };
-        tcp.set_nodelay(true)?;
-
-        let tls_config = self
-            .tls_config
-            .clone()
-            .unwrap_or_else(|| Arc::new(conn::default_tls_config()));
-
-        let stream = match self.transport {
-            Transport::Plain => LdapStream::Plain(tcp),
-            Transport::Tls | Transport::StartTls => {
-                let server_name = ServerName::try_from(self.host.clone())
-                    .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
-
-                if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(tcp, server_name, tls_config.clone(), self.connect_timeout)
-                        .await?
-                } else {
-                    perform_start_tls(
-                        tcp,
-                        server_name,
-                        tls_config.clone(),
-                        self.request_timeout,
-                        self.max_message_size,
-                        self.connect_timeout,
-                    )
-                    .await?
-                }
-            }
-        };
-
-        let start_id = if self.transport == Transport::StartTls {
-            2
-        } else {
-            1
-        };
-        let codec = LdapCodec::new().with_max_message_size(self.max_message_size);
-        Ok(Client {
-            framed: Mutex::new(Framed::new(stream, codec)),
-            next_id: AtomicI32::new(start_id),
-            connected: AtomicBool::new(true),
-            request_timeout: self.request_timeout,
-            max_message_size: self.max_message_size,
-            base_dn: self.base_dn,
-            referral_policy: self.referral_policy,
-            last_reconnect: Mutex::new(None),
-            unsolicited_handler: self.unsolicited_handler,
+        let params = ConnectParams {
+            security: Security::new(self.transport, &self.host)?,
             host: self.host,
             port: self.port,
-            transport: self.transport,
-            tls_config,
+            tls_config: self
+                .tls_config
+                .unwrap_or_else(|| Arc::new(default_client_config())),
             connect_timeout: self.connect_timeout,
-            service_account_dn: self.service_account_dn,
-            service_account_password: self.service_account_password,
-        })
+            request_timeout: self.request_timeout,
+            max_message_size: self.max_message_size,
+        };
+        let session = Session::open(&params, &self.settings.unsolicited_handler).await?;
+        Ok(Client::new(session, params, self.settings))
     }
 }
-
-async fn perform_start_tls(
-    tcp: TcpStream,
-    server_name: ServerName<'static>,
-    tls_config: Arc<ClientConfig>,
-    timeout: Duration,
-    max_message_size: u32,
-    tls_timeout: Duration,
-) -> Result<LdapStream, Error> {
-    let mut framed = Framed::new(
-        tcp,
-        LdapCodec::new().with_max_message_size(max_message_size),
-    );
-
-    let msg = LdapMessage {
-        message_id: MessageId(1),
-        operation: LdapOperation::ExtendedRequest(ExtendedRequest {
-            oid: STARTTLS_OID.to_string(),
-            value: None,
-        }),
-        controls: vec![],
-    };
-    framed.send(msg.encode()).await.map_err(ber_to_io)?;
-
-    let response = match tokio::time::timeout(timeout, framed.next()).await {
-        Ok(Some(Ok(frame))) => LdapMessage::decode(&frame).map_err(Error::Proto)?,
-        Ok(Some(Err(e))) => return Err(ber_to_io(e)),
-        Ok(None) => return Err(Error::ConnectionClosed),
-        Err(_) => return Err(Error::Timeout),
-    };
-
-    match response.operation {
-        LdapOperation::ExtendedResponse(resp) if resp.result.code.is_success() => {}
-        LdapOperation::ExtendedResponse(resp) => {
-            return Err(Error::StartTls(resp.result.diagnostic_message));
-        }
-        _ => return Err(Error::StartTls("unexpected response".into())),
-    }
-
-    let parts = framed.into_parts();
-    if !parts.read_buf.is_empty() || !parts.write_buf.is_empty() {
-        return Err(Error::StartTls(
-            "unexpected buffered data before TLS handshake".into(),
-        ));
-    }
-    let tcp = parts.io;
-    conn::upgrade_to_tls(tcp, server_name, tls_config, tls_timeout).await
-}
-
-type FramedLdap = Framed<LdapStream, LdapCodec>;
 
 const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Client {
-    framed: Mutex<FramedLdap>,
-    next_id: AtomicI32,
-    connected: AtomicBool,
-    request_timeout: Duration,
-    max_message_size: u32,
-    base_dn: Option<String>,
-    referral_policy: ReferralPolicy,
+    /// `None` is a connection that cannot be used: a request that did not
+    /// read its whole answer, for any reason, leaves it empty.
+    session: Mutex<Option<Session>>,
+    params: ConnectParams,
+    settings: Settings,
     last_reconnect: Mutex<Option<tokio::time::Instant>>,
-    unsolicited_handler: UnsolicitedHandler,
-    // Fields stored for reconnect.
-    host: String,
-    port: u16,
-    transport: Transport,
-    tls_config: Arc<ClientConfig>,
-    connect_timeout: Duration,
-    service_account_dn: Option<String>,
-    service_account_password: Option<SecretString>,
 }
 
-fn format_addr(host: &str, port: u16) -> String {
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+fn simple_bind_request(dn: String, password: &SecretString) -> Result<BindRequest, Error> {
+    if !dn.is_empty() && password.expose_secret().is_empty() {
+        return Err(Error::UnauthenticatedBind);
     }
+    Ok(BindRequest {
+        version: 3,
+        name: dn,
+        authentication: BindAuthentication::Simple(Zeroizing::new(
+            password.expose_secret().as_bytes().to_vec(),
+        )),
+    })
 }
 
 impl Client {
-    fn next_message_id(&self) -> MessageId {
-        let id = self
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n > 0 && n < i32::MAX - 1 {
-                    Some(n + 1)
-                } else {
-                    Some(2) // wrap-around: store 2, current caller keeps n
-                }
-            });
-        // fetch_update with an always-Some closure never fails.
-        MessageId(id.unwrap())
+    fn new(session: Session, params: ConnectParams, settings: Settings) -> Self {
+        Self {
+            session: Mutex::new(Some(session)),
+            params,
+            settings,
+            last_reconnect: Mutex::new(None),
+        }
     }
 
-    fn resolve_base_dn(&self, base_dn: String) -> String {
-        if base_dn.is_empty()
-            && let Some(default) = &self.base_dn
-        {
-            return default.clone();
+    /// Runs `run` on the session, and puts the session back only if it
+    /// returns `Ok`. A timeout, an I/O or decode error, an answer for the
+    /// wrong request, and a dropped future all leave the slot empty, so the
+    /// next request cannot read this one's late answer.
+    async fn with_session<T>(
+        &self,
+        run: impl AsyncFnOnce(&mut Session) -> Result<T, TransportError>,
+    ) -> Result<T, Error> {
+        let mut slot = self.session.lock().await;
+        let mut session = slot.take().ok_or(Error::ConnectionClosed)?;
+        let value = run(&mut session).await?;
+        *slot = Some(session);
+        Ok(value)
+    }
+
+    async fn exchange<O: Operation>(
+        &self,
+        operation: &O,
+        controls: Vec<Control>,
+    ) -> Result<O::Output, Error> {
+        let response = self
+            .with_session(async |session| {
+                let id = session.send(operation.to_protocol(), controls).await?;
+                let message = session.receive(id).await?;
+                O::response(message.operation).ok_or_else(|| {
+                    ProtoError::Protocol(format!("unexpected response, expected {}", O::RESPONSE))
+                        .into()
+                })
+            })
+            .await?;
+        O::output(response).map_err(|response| Error::from_failed_result(response.result()))
+    }
+
+    /// `exchange`, following referrals under `ReferralPolicy::Follow`. Each
+    /// referral opens a connection whose own policy is `Return`, so this loop
+    /// counts the hops.
+    async fn execute<O: Operation>(
+        &self,
+        operation: O,
+        controls: Vec<Control>,
+    ) -> Result<O::Output, Error> {
+        let ReferralPolicy::Follow { hop_limit } = self.settings.referral_policy else {
+            return self.exchange(&operation, controls).await;
+        };
+
+        let mut hops = 0;
+        let mut referred: Option<Client> = None;
+        loop {
+            let client = referred.as_ref().unwrap_or(self);
+            match client.exchange(&operation, controls.clone()).await {
+                Err(Error::Referral { urls, .. }) => {
+                    if hops >= hop_limit {
+                        return Err(Error::ReferralHopLimitExceeded);
+                    }
+                    hops += 1;
+                    referred = Some(self.connect_referral(&urls).await?);
+                }
+                other => return other,
+            }
         }
-        base_dn
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        self.session
+            .try_lock()
+            .map_or(true, |session| session.is_some())
     }
 
+    /// Open a new connection and, when a service account is configured,
+    /// bind with it. Any other identity is not restored: a caller that
+    /// bound with its own credentials binds again.
     pub async fn reconnect(&self) -> Result<(), Error> {
         {
             let mut last = self.last_reconnect.lock().await;
@@ -405,109 +402,23 @@ impl Client {
             *last = Some(tokio::time::Instant::now());
         }
 
-        let addr = format_addr(&self.host, self.port);
-        debug!(addr = %addr, transport = ?self.transport, "reconnecting");
+        let session = Session::open(&self.params, &self.settings.unsolicited_handler).await?;
+        *self.session.lock().await = Some(session);
 
-        let tcp = match tokio::time::timeout(self.connect_timeout, TcpStream::connect(&addr)).await
-        {
-            Ok(Ok(tcp)) => tcp,
-            Ok(Err(e)) => return Err(Error::Io(e)),
-            Err(_) => return Err(Error::Timeout),
-        };
-        tcp.set_nodelay(true)?;
-
-        let stream = match self.transport {
-            Transport::Plain => LdapStream::Plain(tcp),
-            Transport::Tls | Transport::StartTls => {
-                let server_name = ServerName::try_from(self.host.clone())
-                    .map_err(|e| Error::InvalidUrl(format!("invalid server name: {e}")))?;
-
-                if self.transport == Transport::Tls {
-                    conn::upgrade_to_tls(
-                        tcp,
-                        server_name,
-                        self.tls_config.clone(),
-                        self.connect_timeout,
-                    )
-                    .await?
-                } else {
-                    perform_start_tls(
-                        tcp,
-                        server_name,
-                        self.tls_config.clone(),
-                        self.request_timeout,
-                        self.max_message_size,
-                        self.connect_timeout,
-                    )
-                    .await?
-                }
-            }
-        };
-
-        let start_id = if self.transport == Transport::StartTls {
-            2
-        } else {
-            1
-        };
-
-        let mut framed = self.framed.lock().await;
-        *framed = Framed::new(
-            stream,
-            LdapCodec::new().with_max_message_size(self.max_message_size),
-        );
-        self.next_id.store(start_id, Ordering::Relaxed);
-        self.connected.store(true, Ordering::Relaxed);
-        drop(framed);
-
-        if self.service_account_dn.is_some()
+        if self.settings.service_account.is_some()
             && let Err(e) = self.rebind_service_account().await
         {
-            self.connected.store(false, Ordering::Relaxed);
+            self.session.lock().await.take();
             return Err(e);
         }
         Ok(())
     }
 
     pub async fn rebind_service_account(&self) -> Result<(), Error> {
-        let dn = self.service_account_dn.as_deref().ok_or_else(|| {
-            Error::Proto(ldap_client_proto::ProtoError::Protocol(
-                "no service account configured".into(),
-            ))
+        let account = self.settings.service_account.as_ref().ok_or_else(|| {
+            Error::Proto(ProtoError::Protocol("no service account configured".into()))
         })?;
-        let password = self.service_account_password.as_ref().ok_or_else(|| {
-            Error::Proto(ldap_client_proto::ProtoError::Protocol(
-                "no service account password configured".into(),
-            ))
-        })?;
-        self.simple_bind(dn, password).await
-    }
-
-    async fn request(&self, operation: LdapOperation) -> Result<LdapMessage, Error> {
-        self.request_with_controls(operation, vec![]).await
-    }
-
-    async fn request_with_controls(
-        &self,
-        operation: LdapOperation,
-        controls: Vec<Control>,
-    ) -> Result<LdapMessage, Error> {
-        let message_id = self.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation,
-            controls,
-        };
-        let data = msg.encode();
-
-        let mut framed = self.framed.lock().await;
-        send_msg(&mut framed, data, &self.connected).await?;
-        recv_msg(
-            &mut framed,
-            self.request_timeout,
-            &self.connected,
-            &self.unsolicited_handler,
-        )
-        .await
+        self.simple_bind(&account.dn, &account.password).await
     }
 
     pub async fn simple_bind(
@@ -515,26 +426,47 @@ impl Client {
         dn: impl Into<String>,
         password: &SecretString,
     ) -> Result<(), Error> {
-        if self.transport == Transport::Plain {
+        let request = simple_bind_request(dn.into(), password)?;
+        if self.params.security.transport() == Transport::Plain {
             tracing::warn!(
                 "simple bind over plain (unencrypted) connection; credentials are sent in cleartext"
             );
         }
-        let op = LdapOperation::BindRequest(BindRequest {
-            version: 3,
-            name: dn.into(),
-            authentication: BindAuthentication::Simple(zeroize::Zeroizing::new(
-                password.expose_secret().as_bytes().to_vec(),
-            )),
-        });
+        self.exchange(&request, Vec::new()).await
+    }
 
-        let response = self.request(op).await?;
-        match response.operation {
-            LdapOperation::BindResponse(resp) => check_result(&resp.result, self.referral_policy),
-            _ => Err(unexpected_response("BindResponse")),
+    pub async fn sasl_external_bind(&self) -> Result<(), Error> {
+        let request = BindRequest {
+            version: 3,
+            name: String::new(),
+            authentication: BindAuthentication::Sasl {
+                mechanism: "EXTERNAL".into(),
+                credentials: None,
+            },
+        };
+        self.exchange(&request, Vec::new()).await
+    }
+
+    /// Bind using one of the supported credential types.
+    pub async fn bind(&self, credentials: BindCredentials<'_>) -> Result<(), Error> {
+        match credentials {
+            BindCredentials::Simple { dn, password } => self.simple_bind(dn, password).await,
+            BindCredentials::ServiceAccount => self.rebind_service_account().await,
+            BindCredentials::SaslExternal => self.sasl_external_bind().await,
         }
     }
 
+    /// Send an unbind request. The connection is closed afterwards.
+    pub async fn unbind(&self) -> Result<(), Error> {
+        let mut slot = self.session.lock().await;
+        let mut session = slot.take().ok_or(Error::ConnectionClosed)?;
+        session
+            .send(ldap_client_proto::LdapOperation::UnbindRequest, Vec::new())
+            .await?;
+        Ok(())
+    }
+
+    /// An empty `base_dn` means the base DN the client was configured with.
     pub async fn search(
         &self,
         base_dn: impl Into<String>,
@@ -542,10 +474,8 @@ impl Client {
         filter: Filter,
         attrs: Vec<String>,
     ) -> Result<Vec<SearchResultEntry>, Error> {
-        let (entries, _controls) = self
-            .search_with_controls(base_dn, scope, filter, attrs, vec![])
-            .await?;
-        Ok(entries)
+        let params = SearchParams::from_legacy(base_dn.into(), scope, filter, attrs);
+        Ok(self.search_with(params).await?.entries)
     }
 
     pub async fn search_with_controls(
@@ -556,38 +486,10 @@ impl Client {
         attrs: Vec<String>,
         controls: Vec<Control>,
     ) -> Result<(Vec<SearchResultEntry>, Vec<Control>), Error> {
-        let message_id = self.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::SearchRequest(SearchRequest {
-                base_dn: self.resolve_base_dn(base_dn.into()),
-                scope,
-                deref_aliases: DerefAliases::NeverDerefAliases,
-                size_limit: 0,
-                time_limit: 0,
-                types_only: false,
-                filter,
-                attributes: attrs,
-            }),
-            controls,
-        };
-        let data = msg.encode();
-
-        let mut framed = self.framed.lock().await;
-        send_msg(&mut framed, data, &self.connected).await?;
-
-        let mut entries = Vec::new();
-        let collected = collect_search_results(
-            &mut framed,
-            self.request_timeout,
-            &self.connected,
-            &mut entries,
-            self.referral_policy,
-            &self.unsolicited_handler,
-        )
-        .await?;
-
-        Ok((entries, collected.controls))
+        let result = self
+            .search_full(base_dn, scope, filter, attrs, controls)
+            .await?;
+        Ok((result.entries, result.controls))
     }
 
     pub async fn search_full(
@@ -598,42 +500,9 @@ impl Client {
         attrs: Vec<String>,
         controls: Vec<Control>,
     ) -> Result<SearchResult, Error> {
-        let message_id = self.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::SearchRequest(SearchRequest {
-                base_dn: self.resolve_base_dn(base_dn.into()),
-                scope,
-                deref_aliases: DerefAliases::NeverDerefAliases,
-                size_limit: 0,
-                time_limit: 0,
-                types_only: false,
-                filter,
-                attributes: attrs,
-            }),
-            controls,
-        };
-        let data = msg.encode();
-
-        let mut framed = self.framed.lock().await;
-        send_msg(&mut framed, data, &self.connected).await?;
-
-        let mut entries = Vec::new();
-        let collected = collect_search_results(
-            &mut framed,
-            self.request_timeout,
-            &self.connected,
-            &mut entries,
-            self.referral_policy,
-            &self.unsolicited_handler,
-        )
-        .await?;
-
-        Ok(SearchResult {
-            entries,
-            referrals: collected.referral_urls,
-            controls: collected.controls,
-        })
+        let params =
+            SearchParams::from_legacy(base_dn.into(), scope, filter, attrs).controls(controls);
+        self.search_with(params).await
     }
 
     pub async fn search_paged(
@@ -644,68 +513,15 @@ impl Client {
         attrs: Vec<String>,
         page_size: i32,
     ) -> Result<Vec<SearchResultEntry>, Error> {
-        const MAX_PAGED_ROUNDS: usize = 100_000;
-        let resolved_base = self.resolve_base_dn(base_dn.to_string());
-        let mut all_entries = Vec::new();
-        let mut cookie = Vec::new();
-        let mut prev_cookie = Vec::new();
-
-        for _ in 0..MAX_PAGED_ROUNDS {
-            let paged =
-                PagedResultsControl::new(page_size).with_cookie(std::mem::take(&mut cookie));
-            let controls = vec![paged.to_control()];
-
-            let message_id = self.next_message_id();
-            let msg = LdapMessage {
-                message_id,
-                operation: LdapOperation::SearchRequest(SearchRequest {
-                    base_dn: resolved_base.clone(),
-                    scope,
-                    deref_aliases: DerefAliases::NeverDerefAliases,
-                    size_limit: 0,
-                    time_limit: 0,
-                    types_only: false,
-                    filter: filter.clone(),
-                    attributes: attrs.clone(),
-                }),
-                controls,
-            };
-            let data = msg.encode();
-
-            let mut framed = self.framed.lock().await;
-            send_msg(&mut framed, data, &self.connected).await?;
-
-            let collected = collect_search_results(
-                &mut framed,
-                self.request_timeout,
-                &self.connected,
-                &mut all_entries,
-                self.referral_policy,
-                &self.unsolicited_handler,
-            )
-            .await?;
-
-            let new_cookie = collected
-                .controls
-                .iter()
-                .find(|c| c.oid == PAGED_RESULTS_OID)
-                .and_then(|c| PagedResultsControl::from_control(c).ok())
-                .map(|p| p.cookie);
-
-            match new_cookie {
-                Some(c) if !c.is_empty() => {
-                    if c == prev_cookie {
-                        // Server returned the same cookie twice. Abort to prevent an infinite loop.
-                        break;
-                    }
-                    prev_cookie = c.clone();
-                    cookie = c;
-                }
-                _ => break,
+        let mut pages = self.search_paged_stream(base_dn, scope, filter, attrs, page_size);
+        let mut entries = Vec::new();
+        while let Some(page) = pages.next_page().await? {
+            entries.extend(page);
+            if entries.len() > MAX_SEARCH_ENTRIES {
+                return Err(Error::SearchEntryLimitExceeded(MAX_SEARCH_ENTRIES));
             }
         }
-
-        Ok(all_entries)
+        Ok(entries)
     }
 
     pub fn search_paged_stream(
@@ -716,200 +532,8 @@ impl Client {
         attrs: Vec<String>,
         page_size: i32,
     ) -> PagedSearch<'_> {
-        PagedSearch {
-            client: self,
-            base_dn: self.resolve_base_dn(base_dn.to_string()),
-            scope,
-            filter,
-            attrs,
-            page_size,
-            cookie: Vec::new(),
-            done: false,
-        }
-    }
-
-    pub async fn add(
-        &self,
-        dn: impl Into<String>,
-        attrs: Vec<ldap_client_proto::PartialAttribute>,
-    ) -> Result<(), Error> {
-        let dn = dn.into();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::AddRequest(AddRequest {
-                dn: dn.clone(),
-                attributes: attrs.clone(),
-            });
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::AddResponse(result) => match try_chase(client, &result).await {
-                    Chase::Ok => return Ok(()),
-                    Chase::Follow(c) => {
-                        chased = Some(*c);
-                        continue;
-                    }
-                    Chase::Err(e) => return Err(e),
-                },
-                _ => return Err(unexpected_response("AddResponse")),
-            }
-        }
-    }
-
-    pub async fn modify(
-        &self,
-        dn: impl Into<String>,
-        changes: Vec<ldap_client_proto::Modification>,
-    ) -> Result<(), Error> {
-        let dn = dn.into();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::ModifyRequest(ModifyRequest {
-                dn: dn.clone(),
-                changes: changes.clone(),
-            });
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::ModifyResponse(result) => match try_chase(client, &result).await {
-                    Chase::Ok => return Ok(()),
-                    Chase::Follow(c) => {
-                        chased = Some(*c);
-                        continue;
-                    }
-                    Chase::Err(e) => return Err(e),
-                },
-                _ => return Err(unexpected_response("ModifyResponse")),
-            }
-        }
-    }
-
-    pub async fn delete(&self, dn: impl Into<String>) -> Result<(), Error> {
-        let dn = dn.into();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::DeleteRequest(dn.clone());
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::DeleteResponse(result) => match try_chase(client, &result).await {
-                    Chase::Ok => return Ok(()),
-                    Chase::Follow(c) => {
-                        chased = Some(*c);
-                        continue;
-                    }
-                    Chase::Err(e) => return Err(e),
-                },
-                _ => return Err(unexpected_response("DeleteResponse")),
-            }
-        }
-    }
-
-    pub async fn compare(
-        &self,
-        dn: impl Into<String>,
-        attr: impl Into<String>,
-        value: impl AsRef<[u8]>,
-    ) -> Result<bool, Error> {
-        let dn = dn.into();
-        let attr = attr.into();
-        let value = value.as_ref().to_vec();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::CompareRequest(CompareRequest {
-                dn: dn.clone(),
-                attr: attr.clone(),
-                value: value.clone(),
-            });
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::CompareResponse(result) => {
-                    use ldap_client_proto::ResultCode;
-                    match result.code {
-                        ResultCode::CompareTrue => return Ok(true),
-                        ResultCode::CompareFalse => return Ok(false),
-                        _ => match try_chase(client, &result).await {
-                            Chase::Ok => return Err(Error::ldap(&result)),
-                            Chase::Follow(c) => {
-                                chased = Some(*c);
-                                continue;
-                            }
-                            Chase::Err(e) => return Err(e),
-                        },
-                    }
-                }
-                _ => return Err(unexpected_response("CompareResponse")),
-            }
-        }
-    }
-
-    pub async fn modify_dn(
-        &self,
-        dn: impl Into<String>,
-        new_rdn: impl Into<String>,
-        delete_old_rdn: bool,
-        new_superior: Option<String>,
-    ) -> Result<(), Error> {
-        let dn = dn.into();
-        let new_rdn = new_rdn.into();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::ModifyDnRequest(ModifyDnRequest {
-                dn: dn.clone(),
-                new_rdn: new_rdn.clone(),
-                delete_old_rdn,
-                new_superior: new_superior.clone(),
-            });
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::ModifyDnResponse(result) => match try_chase(client, &result).await {
-                    Chase::Ok => return Ok(()),
-                    Chase::Follow(c) => {
-                        chased = Some(*c);
-                        continue;
-                    }
-                    Chase::Err(e) => return Err(e),
-                },
-                _ => return Err(unexpected_response("ModifyDnResponse")),
-            }
-        }
-    }
-
-    pub async fn extended(
-        &self,
-        oid: impl Into<String>,
-        value: Option<Vec<u8>>,
-    ) -> Result<ldap_client_proto::ExtendedResponse, Error> {
-        let oid = oid.into();
-        let mut chased: Option<Client> = None;
-        loop {
-            let client = chased.as_ref().unwrap_or(self);
-            let op = LdapOperation::ExtendedRequest(ExtendedRequest {
-                oid: oid.clone(),
-                value: value.clone(),
-            });
-            let response = client.request(op).await?;
-            match response.operation {
-                LdapOperation::ExtendedResponse(resp) => {
-                    match try_chase(client, &resp.result).await {
-                        Chase::Ok => return Ok(resp),
-                        Chase::Follow(c) => {
-                            chased = Some(*c);
-                            continue;
-                        }
-                        Chase::Err(e) => return Err(e),
-                    }
-                }
-                _ => return Err(unexpected_response("ExtendedResponse")),
-            }
-        }
-    }
-
-    pub async fn who_am_i(&self) -> Result<Option<String>, Error> {
-        let resp = self.extended("1.3.6.1.4.1.4203.1.11.3", None).await?;
-        Ok(resp.value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+        let params = SearchParams::from_legacy(base_dn.to_owned(), scope, filter, attrs);
+        PagedSearch::new(self, params, page_size)
     }
 
     pub async fn search_one(
@@ -919,83 +543,40 @@ impl Client {
         filter: Filter,
         attrs: Vec<String>,
     ) -> Result<Option<SearchResultEntry>, Error> {
-        let message_id = self.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::SearchRequest(SearchRequest {
-                base_dn: self.resolve_base_dn(base_dn.into()),
-                scope,
-                deref_aliases: DerefAliases::NeverDerefAliases,
-                size_limit: 2,
-                time_limit: self.request_timeout.as_secs() as i32,
-                types_only: false,
-                filter,
-                attributes: attrs,
-            }),
-            controls: vec![],
+        let params = SearchParams::from_legacy(base_dn.into(), scope, filter, attrs)
+            .size_limit(SEARCH_ONE_SIZE_LIMIT)
+            .time_limit(self.params.request_timeout);
+
+        // SizeLimitExceeded means the server stopped because of our size
+        // limit, which indicates multiple results exist.
+        let entries = match self.search_with(params).await {
+            Ok(result) => result.entries,
+            Err(Error::Ldap {
+                code: ldap_client_proto::ResultCode::SizeLimitExceeded,
+                ..
+            }) => {
+                return Err(Error::MultipleResults);
+            }
+            Err(e) => return Err(e),
         };
-        let data = msg.encode();
 
-        let mut framed = self.framed.lock().await;
-        send_msg(&mut framed, data, &self.connected).await?;
-
-        let mut entries = Vec::new();
-        let result = collect_search_results(
-            &mut framed,
-            self.request_timeout,
-            &self.connected,
-            &mut entries,
-            self.referral_policy,
-            &self.unsolicited_handler,
-        )
-        .await;
-
-        // SizeLimitExceeded means the server stopped because of our size_limit=2,
-        // which indicates multiple results exist.
-        if let Err(Error::Ldap { code, .. }) = &result
-            && *code == ResultCode::SizeLimitExceeded
-        {
-            return Err(Error::MultipleResults);
-        }
-        result?;
-
-        match entries.len() {
-            0 => Ok(None),
-            1 => Ok(Some(entries.into_iter().next().unwrap())),
-            _ => Err(Error::MultipleResults),
+        let mut entries = entries.into_iter();
+        match (entries.next(), entries.next()) {
+            (None, _) => Ok(None),
+            (Some(entry), None) => Ok(Some(entry)),
+            (Some(_), Some(_)) => Err(Error::MultipleResults),
         }
     }
 
     pub async fn root_dse(&self) -> Result<SearchResultEntry, Error> {
-        let entries = self
-            .search(
-                "",
-                SearchScope::BaseObject,
-                Filter::present("objectClass"),
-                vec!["*".into(), "+".into()],
-            )
-            .await?;
-        entries.into_iter().next().ok_or_else(|| {
-            Error::Proto(ldap_client_proto::ProtoError::Protocol(
-                "root DSE not found".into(),
-            ))
-        })
-    }
-
-    pub async fn sasl_external_bind(&self) -> Result<(), Error> {
-        let op = LdapOperation::BindRequest(BindRequest {
-            version: 3,
-            name: String::new(),
-            authentication: BindAuthentication::Sasl {
-                mechanism: "EXTERNAL".into(),
-                credentials: None,
-            },
-        });
-        let response = self.request(op).await?;
-        match response.operation {
-            LdapOperation::BindResponse(resp) => check_result(&resp.result, self.referral_policy),
-            _ => Err(unexpected_response("BindResponse")),
-        }
+        let params = SearchParams::new("", SearchScope::BaseObject, Filter::present("objectClass"))
+            .attributes(["*", "+"]);
+        let result = self.search_with(params).await?;
+        result
+            .entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Proto(ProtoError::Protocol("root DSE not found".into())))
     }
 
     /// Retrieve all values of a multi-valued attribute using Active Directory
@@ -1011,7 +592,6 @@ impl Client {
         attr: &str,
     ) -> Result<Vec<Vec<u8>>, Error> {
         const MAX_RANGE_ROUNDS: usize = 100_000;
-        let resolved_base = self.resolve_base_dn(base_dn.to_string());
         let mut all_values: Vec<Vec<u8>> = Vec::new();
         let mut range_start: u32 = 0;
 
@@ -1019,7 +599,7 @@ impl Client {
             let range_attr = format!("{attr};range={range_start}-*");
             let entries = self
                 .search(
-                    resolved_base.clone(),
+                    base_dn,
                     SearchScope::BaseObject,
                     filter.clone(),
                     vec![range_attr],
@@ -1071,370 +651,137 @@ impl Client {
         Ok(all_values)
     }
 
-    /// Connect to a referral server, optionally binding with the service account.
+    pub async fn add(
+        &self,
+        dn: impl Into<String>,
+        attrs: Vec<ldap_client_proto::PartialAttribute>,
+    ) -> Result<(), Error> {
+        let request = AddRequest {
+            dn: dn.into(),
+            attributes: attrs,
+        };
+        self.execute(request, Vec::new()).await
+    }
+
+    pub async fn modify(
+        &self,
+        dn: impl Into<String>,
+        changes: Vec<ldap_client_proto::Modification>,
+    ) -> Result<(), Error> {
+        let request = ModifyRequest {
+            dn: dn.into(),
+            changes,
+        };
+        self.execute(request, Vec::new()).await
+    }
+
+    pub async fn delete(&self, dn: impl Into<String>) -> Result<(), Error> {
+        self.execute(Delete(dn.into()), Vec::new()).await
+    }
+
+    pub async fn compare(
+        &self,
+        dn: impl Into<String>,
+        attr: impl Into<String>,
+        value: impl AsRef<[u8]>,
+    ) -> Result<bool, Error> {
+        let request = CompareRequest {
+            dn: dn.into(),
+            attr: attr.into(),
+            value: value.as_ref().to_vec(),
+        };
+        self.execute(request, Vec::new()).await
+    }
+
+    pub async fn modify_dn(
+        &self,
+        dn: impl Into<String>,
+        new_rdn: impl Into<String>,
+        delete_old_rdn: bool,
+        new_superior: Option<String>,
+    ) -> Result<(), Error> {
+        let request = ModifyDnRequest {
+            dn: dn.into(),
+            new_rdn: new_rdn.into(),
+            delete_old_rdn,
+            new_superior,
+        };
+        self.execute(request, Vec::new()).await
+    }
+
+    /// Send an extended request. StartTLS is refused: it is negotiated when
+    /// the connection opens, with [`Transport::StartTls`].
+    pub async fn extended(
+        &self,
+        oid: impl Into<String>,
+        value: Option<Vec<u8>>,
+    ) -> Result<ExtendedResponse, Error> {
+        let oid = oid.into();
+        if oid == STARTTLS_OID {
+            return Err(Error::StartTls(
+                "StartTLS is negotiated at connect time; use Transport::StartTls".into(),
+            ));
+        }
+        self.execute(ExtendedRequest { oid, value }, Vec::new())
+            .await
+    }
+
+    pub async fn who_am_i(&self) -> Result<Option<String>, Error> {
+        let resp = self.extended(WHO_AM_I_OID, None).await?;
+        Ok(resp.value.map(|v| String::from_utf8_lossy(&v).into_owned()))
+    }
+
+    /// Connect to a referral server, binding with the service account if
+    /// [`ReferralCredentials::ServiceAccount`] is chosen.
     ///
     /// Tries each URL in order, returning the first successful connection.
-    /// The returned client has its hop limit decremented by one.
-    async fn connect_referral(&self, urls: &[String], hop_limit: u8) -> Result<Client, Error> {
-        if hop_limit == 0 {
-            return Err(Error::ReferralHopLimitExceeded);
-        }
-
+    /// The returned client's policy is `ReferralPolicy::Return`: the caller
+    /// counts hops.
+    async fn connect_referral(&self, urls: &[String]) -> Result<Client, Error> {
         let mut last_err = None;
         for raw_url in urls {
-            let referral_url = match LdapUrl::parse(raw_url) {
-                Ok(u) => u,
-                Err(_) => continue,
+            let Ok(url) = LdapUrl::parse(raw_url) else {
+                continue;
             };
-            let transport = match referral_url.scheme {
-                LdapScheme::Ldap => Transport::Plain,
-                LdapScheme::Ldaps => Transport::Tls,
-            };
-            if self.transport != Transport::Plain && transport == Transport::Plain {
+            let transport = Transport::from(url.scheme);
+            if self.params.security.transport() != Transport::Plain && transport == Transport::Plain
+            {
                 debug!(url = %raw_url, "skipping referral that would downgrade from TLS to plain");
                 continue;
             }
-            let mut builder =
-                ClientBuilder::new(referral_url.host.clone(), referral_url.effective_port())
-                    .transport(transport)
-                    .tls_config(self.tls_config.clone())
-                    .connect_timeout(self.connect_timeout)
-                    .request_timeout(self.request_timeout)
-                    .max_message_size(self.max_message_size)
-                    .referral_policy(ReferralPolicy::Follow {
-                        hop_limit: hop_limit - 1,
-                    });
-            builder.unsolicited_handler = self.unsolicited_handler.clone();
-            if let Some(dn) = &self.service_account_dn
-                && let Some(pw) = &self.service_account_password
-            {
-                builder = builder.service_account(dn.clone(), pw.clone());
-            }
-            match builder.connect().await {
-                Ok(client) => {
-                    // Bind with service account if configured.
-                    if client.service_account_dn.is_some()
-                        && let Err(e) = client.rebind_service_account().await
-                    {
-                        last_err = Some(e);
-                        continue;
-                    }
-                    return Ok(client);
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
+            match self.open_referral(&url, transport).await {
+                Ok(client) => return Ok(client),
+                Err(e) => last_err = Some(e),
             }
         }
 
         Err(last_err.unwrap_or(Error::InvalidUrl("no valid referral URLs".into())))
     }
 
-    /// Bind using one of the supported credential types.
-    pub async fn bind(&self, credentials: BindCredentials<'_>) -> Result<(), Error> {
-        match credentials {
-            BindCredentials::Simple { dn, password } => self.simple_bind(dn, password).await,
-            BindCredentials::ServiceAccount => self.rebind_service_account().await,
-            BindCredentials::SaslExternal => self.sasl_external_bind().await,
-        }
-    }
-
-    pub async fn unbind(&self) -> Result<(), Error> {
-        let message_id = self.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::UnbindRequest,
-            controls: vec![],
+    async fn open_referral(&self, url: &LdapUrl, transport: Transport) -> Result<Client, Error> {
+        let params = ConnectParams {
+            host: url.host.clone(),
+            port: url.effective_port(),
+            security: Security::new(transport, &url.host)?,
+            ..self.params.clone()
         };
-        let data = msg.encode();
-        let mut framed = self.framed.lock().await;
-        send_msg(&mut framed, data, &self.connected).await
-    }
-}
-
-/// Incremental paged search that yields one page of results at a time.
-///
-/// Created via [`Client::search_paged_stream`]. Call [`next_page`](PagedSearch::next_page)
-/// repeatedly to fetch pages. If you stop before exhausting results, call
-/// [`cancel`](PagedSearch::cancel) to release the server-side cookie.
-pub struct PagedSearch<'a> {
-    client: &'a Client,
-    base_dn: String,
-    scope: SearchScope,
-    filter: Filter,
-    attrs: Vec<String>,
-    page_size: i32,
-    cookie: Vec<u8>,
-    done: bool,
-}
-
-impl<'a> PagedSearch<'a> {
-    /// Fetch the next page of results.
-    ///
-    /// Returns `Ok(Some(entries))` for each page, `Ok(None)` when all pages
-    /// have been consumed.
-    pub async fn next_page(&mut self) -> Result<Option<Vec<SearchResultEntry>>, Error> {
-        if self.done {
-            return Ok(None);
-        }
-
-        let paged =
-            PagedResultsControl::new(self.page_size).with_cookie(std::mem::take(&mut self.cookie));
-        let controls = vec![paged.to_control()];
-
-        let message_id = self.client.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::SearchRequest(SearchRequest {
-                base_dn: self.base_dn.clone(),
-                scope: self.scope,
-                deref_aliases: DerefAliases::NeverDerefAliases,
-                size_limit: 0,
-                time_limit: 0,
-                types_only: false,
-                filter: self.filter.clone(),
-                attributes: self.attrs.clone(),
-            }),
-            controls,
+        let session = Session::open(&params, &self.settings.unsolicited_handler).await?;
+        let settings = Settings {
+            base_dn: None,
+            service_account: match self.settings.referral_credentials {
+                ReferralCredentials::ServiceAccount => self.settings.service_account.clone(),
+                ReferralCredentials::Anonymous => None,
+            },
+            referral_policy: ReferralPolicy::Return,
+            referral_credentials: ReferralCredentials::Anonymous,
+            unsolicited_handler: self.settings.unsolicited_handler.clone(),
         };
-        let data = msg.encode();
-
-        let mut framed = self.client.framed.lock().await;
-        send_msg(&mut framed, data, &self.client.connected).await?;
-
-        let mut entries = Vec::new();
-        let collected = collect_search_results(
-            &mut framed,
-            self.client.request_timeout,
-            &self.client.connected,
-            &mut entries,
-            self.client.referral_policy,
-            &self.client.unsolicited_handler,
-        )
-        .await?;
-
-        let new_cookie = collected
-            .controls
-            .iter()
-            .find(|c| c.oid == PAGED_RESULTS_OID)
-            .and_then(|c| PagedResultsControl::from_control(c).ok())
-            .map(|p| p.cookie);
-
-        match new_cookie {
-            Some(c) if !c.is_empty() => self.cookie = c,
-            _ => self.done = true,
+        let client = Client::new(session, params, settings);
+        if client.settings.service_account.is_some() {
+            client.rebind_service_account().await?;
         }
-
-        Ok(Some(entries))
+        Ok(client)
     }
-
-    /// Send an abandon request (page size 0) to release the server cookie.
-    ///
-    /// Call this if you stop iterating before all pages are consumed. If you
-    /// don't, the server cookie will eventually time out on its own (~120 s).
-    pub async fn cancel(&mut self) -> Result<(), Error> {
-        if self.done {
-            return Ok(());
-        }
-        self.done = true;
-
-        let paged = PagedResultsControl::new(0).with_cookie(std::mem::take(&mut self.cookie));
-        let controls = vec![paged.to_control()];
-
-        let message_id = self.client.next_message_id();
-        let msg = LdapMessage {
-            message_id,
-            operation: LdapOperation::SearchRequest(SearchRequest {
-                base_dn: self.base_dn.clone(),
-                scope: self.scope,
-                deref_aliases: DerefAliases::NeverDerefAliases,
-                size_limit: 0,
-                time_limit: 0,
-                types_only: false,
-                filter: self.filter.clone(),
-                attributes: self.attrs.clone(),
-            }),
-            controls,
-        };
-        let data = msg.encode();
-
-        let mut framed = self.client.framed.lock().await;
-        send_msg(&mut framed, data, &self.client.connected).await?;
-
-        let mut entries = Vec::new();
-        collect_search_results(
-            &mut framed,
-            self.client.request_timeout,
-            &self.client.connected,
-            &mut entries,
-            self.client.referral_policy,
-            &self.client.unsolicited_handler,
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    /// Returns `true` once all pages have been consumed or `cancel` was called.
-    pub fn is_done(&self) -> bool {
-        self.done
-    }
-}
-
-/// Result of collecting search response messages.
-struct CollectedSearch {
-    controls: Vec<Control>,
-    referral_urls: Vec<String>,
-}
-
-async fn collect_search_results(
-    framed: &mut FramedLdap,
-    timeout: Duration,
-    connected: &AtomicBool,
-    entries: &mut Vec<SearchResultEntry>,
-    referral_policy: ReferralPolicy,
-    unsolicited_handler: &UnsolicitedHandler,
-) -> Result<CollectedSearch, Error> {
-    let mut referral_urls = Vec::new();
-    loop {
-        let response = recv_msg(framed, timeout, connected, unsolicited_handler).await?;
-        match response.operation {
-            LdapOperation::SearchResultEntry(entry) => {
-                if entries.len() >= MAX_SEARCH_ENTRIES {
-                    return Err(Error::SearchEntryLimitExceeded(MAX_SEARCH_ENTRIES));
-                }
-                entries.push(entry);
-            }
-            LdapOperation::SearchResultDone(result) => {
-                // Collect referral URLs from the Done result before checking.
-                if result.code.is_referral() {
-                    referral_urls.extend(result.referral.iter().cloned());
-                }
-                check_result(&result, referral_policy)?;
-                return Ok(CollectedSearch {
-                    controls: response.controls,
-                    referral_urls,
-                });
-            }
-            LdapOperation::SearchResultReference(urls) => {
-                referral_urls.extend(urls);
-            }
-            _ => return Err(unexpected_response("SearchResult*")),
-        }
-    }
-}
-
-async fn send_msg(
-    framed: &mut FramedLdap,
-    data: Vec<u8>,
-    connected: &AtomicBool,
-) -> Result<(), Error> {
-    framed.send(data).await.map_err(|e| {
-        connected.store(false, Ordering::Relaxed);
-        ber_to_io(e)
-    })
-}
-
-async fn recv_msg(
-    framed: &mut FramedLdap,
-    timeout: Duration,
-    connected: &AtomicBool,
-    unsolicited_handler: &UnsolicitedHandler,
-) -> Result<LdapMessage, Error> {
-    loop {
-        let msg = match tokio::time::timeout(timeout, framed.next()).await {
-            Ok(Some(Ok(frame))) => LdapMessage::decode(&frame).map_err(Error::Proto)?,
-            Ok(Some(Err(e))) => {
-                connected.store(false, Ordering::Relaxed);
-                return Err(ber_to_io(e));
-            }
-            Ok(None) => {
-                connected.store(false, Ordering::Relaxed);
-                return Err(Error::ConnectionClosed);
-            }
-            Err(_) => {
-                // After a timeout the connection is desynchronized: the server
-                // may still send the response later. Force a reconnect.
-                connected.store(false, Ordering::Relaxed);
-                return Err(Error::Timeout);
-            }
-        };
-
-        // Handle unsolicited notifications (message_id == 0).
-        if msg.message_id == MessageId(0) {
-            if let LdapOperation::ExtendedResponse(ref resp) = msg.operation {
-                if resp.oid.as_deref() == Some(NOTICE_OF_DISCONNECTION_OID) {
-                    connected.store(false, Ordering::Relaxed);
-                    return Err(Error::ConnectionClosed);
-                }
-                unsolicited_handler(resp);
-            }
-            continue;
-        }
-
-        return Ok(msg);
-    }
-}
-
-fn ber_to_io(e: ldap_client_ber::BerError) -> Error {
-    match e {
-        ldap_client_ber::BerError::Io(io) => Error::Io(io),
-        other => Error::Ber(other),
-    }
-}
-
-fn check_result(result: &ProtoLdapResult, referral_policy: ReferralPolicy) -> Result<(), Error> {
-    if result.code.is_success() {
-        return Ok(());
-    }
-    if result.code.is_referral() {
-        return match referral_policy {
-            ReferralPolicy::Ignore => Ok(()),
-            ReferralPolicy::Return | ReferralPolicy::Follow { .. } => Err(Error::Referral {
-                urls: result.referral.clone(),
-                result: result.clone(),
-            }),
-        };
-    }
-    Err(Error::ldap(result))
-}
-
-/// Outcome of checking an LDAP result and potentially chasing a referral.
-enum Chase {
-    Ok,
-    Follow(Box<Client>),
-    Err(Error),
-}
-
-/// Check the LDAP result: if success, return `Chase::Ok`. If a referral
-/// and the client's policy is `Follow`, connect to the referral and return
-/// `Chase::Follow`. Otherwise return `Chase::Err`.
-async fn try_chase(client: &Client, result: &ProtoLdapResult) -> Chase {
-    if result.code.is_success() {
-        return Chase::Ok;
-    }
-    if result.code.is_referral() {
-        return match client.referral_policy {
-            ReferralPolicy::Ignore => Chase::Ok,
-            ReferralPolicy::Return => Chase::Err(Error::Referral {
-                urls: result.referral.clone(),
-                result: result.clone(),
-            }),
-            ReferralPolicy::Follow { hop_limit } => {
-                match client.connect_referral(&result.referral, hop_limit).await {
-                    Ok(c) => Chase::Follow(Box::new(c)),
-                    Err(e) => Chase::Err(e),
-                }
-            }
-        };
-    }
-    Chase::Err(Error::ldap(result))
-}
-
-fn unexpected_response(expected: &str) -> Error {
-    Error::Proto(ldap_client_proto::ProtoError::Protocol(format!(
-        "unexpected response, expected {expected}"
-    )))
 }
 
 /// Parse an AD range option from an attribute name.

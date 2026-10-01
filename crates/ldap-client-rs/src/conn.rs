@@ -62,14 +62,6 @@ impl AsyncWrite for LdapStream {
     }
 }
 
-pub fn default_tls_config() -> ClientConfig {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth()
-}
-
 #[cfg(feature = "danger-disable-verify")]
 pub fn danger_no_verify_tls_config() -> ClientConfig {
     use rustls::DigitallySignedStruct;

@@ -12,6 +12,7 @@ pub use tag::{Class, Tag};
 pub use writer::BerWriter;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BerError {
     #[error("unexpected tag: expected {expected:?}, got {actual:?}")]
     UnexpectedTag { expected: Tag, actual: Tag },

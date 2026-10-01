@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::length::encode_length;
-use crate::tag::{BOOLEAN, ENUMERATED, INTEGER, OCTET_STRING, Tag};
+use crate::tag::{BOOLEAN, ENUMERATED, INTEGER, NULL, OCTET_STRING, Tag};
 
 /// BER encoder that writes into an owned byte buffer.
 pub struct BerWriter {
@@ -52,12 +52,14 @@ impl BerWriter {
     }
 
     pub fn write_integer(&mut self, value: i64) -> &mut Self {
-        let tag_bytes = Tag::universal(INTEGER).encode();
-        self.buf.extend_from_slice(&tag_bytes);
+        self.write_signed(INTEGER, value)
+    }
+
+    fn write_signed(&mut self, number: u32, value: i64) -> &mut Self {
+        self.buf.extend_from_slice(&Tag::universal(number).encode());
 
         let content = encode_signed_integer(value);
-        let len_bytes = encode_length(content.len());
-        self.buf.extend_from_slice(&len_bytes);
+        self.buf.extend_from_slice(&encode_length(content.len()));
         self.buf.extend_from_slice(&content);
         self
     }
@@ -81,19 +83,12 @@ impl BerWriter {
     }
 
     pub fn write_enumerated(&mut self, value: i64) -> &mut Self {
-        let tag_bytes = Tag::universal(ENUMERATED).encode();
-        self.buf.extend_from_slice(&tag_bytes);
-
-        let content = encode_signed_integer(value);
-        let len_bytes = encode_length(content.len());
-        self.buf.extend_from_slice(&len_bytes);
-        self.buf.extend_from_slice(&content);
-        self
+        self.write_signed(ENUMERATED, value)
     }
 
     pub fn write_null(&mut self) -> &mut Self {
-        self.buf.push(0x05); // NULL tag
-        self.buf.push(0x00); // length 0
+        self.buf.extend_from_slice(&Tag::universal(NULL).encode());
+        self.buf.push(0x00);
         self
     }
 

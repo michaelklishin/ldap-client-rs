@@ -255,9 +255,29 @@ fn parse_deeply_nested_filter_rejected() {
 }
 
 #[test]
-fn find_value_end_invalid_escape_stops_at_paren() {
-    let f = Filter::parse("(cn=a\\2)").unwrap();
-    assert_eq!(f, Filter::eq("cn", "a\\2"));
+fn an_incomplete_escape_is_refused() {
+    assert!(Filter::parse("(cn=a\\2)").is_err());
+}
+
+#[test]
+fn a_bare_backslash_is_refused() {
+    assert!(Filter::parse("(cn=a\\b)").is_err());
+}
+
+#[test]
+fn a_signed_escape_is_refused() {
+    assert!(Filter::parse("(cn=\\+4)").is_err());
+}
+
+#[test]
+fn an_uppercase_hex_escape_decodes() {
+    assert_eq!(Filter::parse("(cn=\\2A)").unwrap(), Filter::eq("cn", "*"));
+}
+
+#[test]
+fn an_escape_error_names_the_byte_offset() {
+    let err = Filter::parse("(cn=ab\\q)").unwrap_err().to_string();
+    assert!(err.contains("byte 6"), "{err}");
 }
 
 #[test]
@@ -409,4 +429,161 @@ fn extensible_match_no_attr_no_rule_no_dn_rejected() {
         Filter::parse("(:=value)").is_err(),
         "extensible match with no attr, rule, or dn must be rejected"
     );
+}
+
+#[test]
+fn an_attribute_with_a_parenthesis_is_refused() {
+    assert!(Filter::parse("((cn=x)").is_err());
+}
+
+#[test]
+fn an_empty_attribute_is_refused() {
+    assert!(Filter::parse("(=x)").is_err());
+}
+
+#[test]
+fn an_attribute_with_a_space_is_refused() {
+    assert!(Filter::parse("(c n=x)").is_err());
+}
+
+#[test]
+fn an_attribute_with_options_is_accepted() {
+    assert_eq!(
+        Filter::parse("(cn;lang-en=x)").unwrap(),
+        Filter::eq("cn;lang-en", "x")
+    );
+}
+
+#[test]
+fn a_numeric_oid_attribute_is_accepted() {
+    assert_eq!(
+        Filter::parse("(2.5.4.3=x)").unwrap(),
+        Filter::eq("2.5.4.3", "x")
+    );
+}
+
+#[test]
+fn an_attribute_with_an_underscore_is_accepted() {
+    assert!(Filter::parse("(my_attr=x)").is_ok());
+}
+
+#[test]
+fn an_empty_attribute_option_is_refused() {
+    assert!(Filter::parse("(cn;=x)").is_err());
+}
+
+#[test]
+fn an_invalid_matching_rule_is_refused() {
+    assert!(Filter::parse("(cn:dn:bad rule:=x)").is_err());
+}
+
+#[test]
+fn a_three_part_extensible_match_needs_dn_in_the_middle() {
+    assert!(Filter::parse("(cn:foo:1.2.3:=x)").is_err());
+}
+
+#[test]
+fn an_extensible_match_does_not_borrow_a_later_filter() {
+    assert!(Filter::parse("(&(cn:dn:x=y)(uid:=a))").is_err());
+}
+
+#[test]
+fn a_comparison_with_a_colon_attribute_is_refused() {
+    assert!(Filter::parse("(cn:>=5)").is_err());
+}
+
+#[test]
+fn display_of_an_injected_attribute_does_not_parse() {
+    let f = Filter::eq("cn)(uid", "x");
+    assert!(Filter::parse(&f.to_string()).is_err());
+}
+
+#[test]
+fn display_escapes_an_injected_matching_rule() {
+    let f = Filter::extensible_match(Some("1.2)(uid=*"), Some("cn"), "x", false);
+    assert!(Filter::parse(&f.to_string()).is_err());
+}
+
+#[test]
+fn every_variant_escapes_an_invalid_attribute() {
+    let attr = "cn)(uid";
+    let filters = [
+        Filter::eq(attr, "x"),
+        Filter::approx(attr, "x"),
+        Filter::gte(attr, "x"),
+        Filter::lte(attr, "x"),
+        Filter::present(attr),
+        Filter::substring(attr, Some("a".into()), vec![], None),
+    ];
+    for f in filters {
+        assert!(Filter::parse(&f.to_string()).is_err(), "{f:?}");
+    }
+}
+
+#[test]
+fn a_binary_value_parses() {
+    let f = Filter::parse("(objectGUID=\\a1\\b2)").unwrap();
+    assert_eq!(f, Filter::eq("objectGUID", vec![0xA1, 0xB2]));
+}
+
+#[test]
+fn a_binary_value_displays_with_hex_escapes() {
+    let f = Filter::eq("objectGUID", vec![0xA1, b'a', 0xB2]);
+    assert_eq!(f.to_string(), "(objectGUID=\\a1a\\b2)");
+}
+
+#[test]
+fn invalid_utf8_survives_a_ber_round_trip() {
+    let f = Filter::eq("objectGUID", vec![0xFF, 0xFE, 0x00]);
+    let mut w = BerWriter::new();
+    f.encode(&mut w);
+    let decoded = Filter::decode(&mut BerReader::new(w.as_bytes())).unwrap();
+    assert_eq!(decoded, f);
+}
+
+#[test]
+fn a_binary_substring_part_round_trips_through_the_string_form() {
+    let f = Filter::Substring {
+        attr: "objectSid".into(),
+        initial: Some(vec![0x01, 0xFF].into()),
+        any: vec![],
+        r#final: Some(vec![0x80].into()),
+    };
+    assert_eq!(Filter::parse(&f.to_string()).unwrap(), f);
+}
+
+#[test]
+fn assertion_values_expose_their_bytes_and_text() {
+    use ldap_client_proto::AssertionValue;
+    let text = AssertionValue::from("abc");
+    assert_eq!(text.as_bytes(), b"abc");
+    assert_eq!(text.to_str(), Some("abc"));
+    let binary = AssertionValue::from(&[0xFF][..]);
+    assert_eq!(binary.to_str(), None);
+    assert_eq!(binary.into_bytes(), vec![0xFF]);
+}
+
+#[test]
+fn a_ber_attribute_that_is_not_utf8_is_refused() {
+    let mut w = BerWriter::new();
+    w.write_octet_string(ldap_client_ber::Tag::context(7), &[0xFF]);
+    assert!(Filter::decode(&mut BerReader::new(w.as_bytes())).is_err());
+}
+
+#[test]
+fn a_constructed_present_filter_is_refused() {
+    let mut r = BerReader::new(&[0xA7, 0x00]);
+    assert!(Filter::decode(&mut r).is_err());
+}
+
+#[test]
+fn a_comparison_value_keeps_a_literal_star() {
+    let f = Filter::parse("(cn>=a*b)").unwrap();
+    assert_eq!(f, Filter::gte("cn", "a*b"));
+}
+
+#[test]
+fn too_many_wildcard_parts_are_refused() {
+    let value = "a*".repeat(100);
+    assert!(Filter::parse(&format!("(cn={value})")).is_err());
 }

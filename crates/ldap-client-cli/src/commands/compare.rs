@@ -3,6 +3,8 @@
 use clap::Args;
 use ldap_client::Client;
 
+use crate::error::CliError;
+
 #[derive(Args)]
 pub struct CompareArgs {
     /// DN of the entry
@@ -18,7 +20,7 @@ pub struct CompareArgs {
     value: String,
 }
 
-pub async fn run(client: &Client, args: CompareArgs) -> Result<(), ldap_client::Error> {
+pub async fn run(client: &Client, args: CompareArgs) -> Result<(), CliError> {
     let result = client
         .compare(&args.dn, &args.attr, args.value.as_bytes())
         .await?;

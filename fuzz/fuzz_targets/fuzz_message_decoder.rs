@@ -2,8 +2,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use ldap_client_proto::LdapMessage;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Decode should not panic regardless of input.

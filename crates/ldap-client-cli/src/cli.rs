@@ -4,32 +4,52 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use ldap_client::{Client, ClientBuilder, SecretString, Transport};
-use zeroize::Zeroize;
 
 use crate::commands;
+use crate::error::CliError;
+
+pub enum Credentials {
+    Anonymous,
+    Simple { dn: String, password: SecretString },
+}
+
+impl Credentials {
+    fn from_args(dn: Option<String>, password: Option<SecretString>) -> Result<Self, CliError> {
+        match (dn, password) {
+            (Some(dn), Some(password)) => Ok(Self::Simple { dn, password }),
+            (None, None) => Ok(Self::Anonymous),
+            (Some(_), None) => Err(CliError::Usage("--bind-dn needs --password")),
+            (None, Some(_)) => Err(CliError::Usage("--password needs --bind-dn")),
+        }
+    }
+}
+
+fn parse_secret(value: &str) -> Result<SecretString, std::convert::Infallible> {
+    Ok(SecretString::from(value))
+}
 
 #[derive(Parser)]
 #[command(name = "ldap-client", about = "Command-line LDAP client", version)]
 pub struct Cli {
     /// LDAP URL (ldap:// or ldaps://)
-    #[arg(long, env = "LDAP_URL")]
+    #[arg(long, env = "LDAP_URL", conflicts_with_all = ["tls", "starttls"])]
     url: Option<String>,
 
     /// LDAP server host
     #[arg(long, env = "LDAP_HOST", default_value = "localhost")]
     host: String,
 
-    /// LDAP server port
-    #[arg(long, env = "LDAP_PORT", default_value_t = 389)]
-    port: u16,
+    /// LDAP server port (636 with --tls, 389 otherwise)
+    #[arg(long, env = "LDAP_PORT")]
+    port: Option<u16>,
 
     /// Bind DN
     #[arg(long, env = "LDAP_BIND_DN")]
     bind_dn: Option<String>,
 
     /// Bind password (prefer LDAP_PASSWORD env var to avoid shell history exposure)
-    #[arg(long, env = "LDAP_PASSWORD", hide_env_values = true)]
-    password: Option<String>,
+    #[arg(long, env = "LDAP_PASSWORD", hide_env_values = true, value_parser = parse_secret)]
+    password: Option<SecretString>,
 
     /// Use TLS (ldaps)
     #[arg(long, conflicts_with = "starttls")]
@@ -78,8 +98,13 @@ enum Command {
 }
 
 impl Cli {
-    pub async fn run(mut self) -> Result<(), ldap_client::Error> {
-        let client = self.connect().await?;
+    pub async fn run(self) -> Result<(), CliError> {
+        let credentials = Credentials::from_args(self.bind_dn.clone(), self.password.clone())?;
+        if matches!(self.command, Command::Bind) && matches!(credentials, Credentials::Anonymous) {
+            return Err(CliError::Usage("`bind` needs --bind-dn"));
+        }
+
+        let client = self.connect(credentials).await?;
 
         match self.command {
             Command::Search(args) => commands::search::run(&client, args).await,
@@ -94,22 +119,24 @@ impl Cli {
         }
     }
 
-    async fn connect(&mut self) -> Result<Client, ldap_client::Error> {
-        let mut builder = if let Some(url) = &self.url {
-            if self.tls || self.starttls {
-                return Err(ldap_client::Error::InvalidUrl(
-                    "--tls / --starttls cannot be combined with --url".into(),
-                ));
-            }
-            ClientBuilder::from_url(url)?
+    fn transport(&self) -> Transport {
+        if self.tls {
+            Transport::Tls
+        } else if self.starttls {
+            Transport::StartTls
         } else {
-            let mut b = ClientBuilder::new(&self.host, self.port);
-            if self.tls {
-                b = b.transport(Transport::Tls);
-            } else if self.starttls {
-                b = b.transport(Transport::StartTls);
+            Transport::Plain
+        }
+    }
+
+    async fn connect(&self, credentials: Credentials) -> Result<Client, ldap_client::Error> {
+        let mut builder = match &self.url {
+            Some(url) => ClientBuilder::from_url(url)?,
+            None => {
+                let transport = self.transport();
+                let port = self.port.unwrap_or_else(|| transport.default_port());
+                ClientBuilder::new(&self.host, port).transport(transport)
             }
-            b
         };
 
         builder = builder.timeout(Duration::from_secs(self.timeout));
@@ -134,14 +161,8 @@ impl Cli {
 
         let client = builder.connect().await?;
 
-        if let Some(dn) = &self.bind_dn {
-            if self.password.is_none() {
-                tracing::warn!("--bind-dn set without --password; binding with empty password");
-            }
-            let mut raw = self.password.take().unwrap_or_default();
-            let secret = SecretString::from(raw.clone());
-            raw.zeroize();
-            client.simple_bind(dn, &secret).await?;
+        if let Credentials::Simple { dn, password } = credentials {
+            client.simple_bind(&dn, &password).await?;
             tracing::debug!(bind_dn = %dn, "bound successfully");
         }
 

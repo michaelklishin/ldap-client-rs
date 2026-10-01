@@ -819,7 +819,7 @@ fn result_code_transient() {
 fn result_code_display() {
     use ldap_client_proto::ResultCode;
     let s = format!("{}", ResultCode::InvalidCredentials);
-    assert_eq!(s, "InvalidCredentials");
+    assert_eq!(s, "invalidCredentials (49)");
 }
 
 #[test]
@@ -1013,4 +1013,261 @@ fn has_ldap_result_trait() {
         value: None,
     };
     assert!(ext_resp.is_success());
+}
+
+#[test]
+fn next_wraps_from_the_largest_id_to_the_first() {
+    assert_eq!(MessageId(i32::MAX).next(), MessageId::FIRST);
+    assert_eq!(MessageId::FIRST.next(), MessageId(2));
+    assert_eq!(MessageId::UNSOLICITED.next(), MessageId::FIRST);
+    assert_eq!(MessageId(7).get(), 7);
+}
+
+#[test]
+fn message_ids_in_range_convert() {
+    assert_eq!(MessageId::try_from(0).unwrap(), MessageId::UNSOLICITED);
+    assert_eq!(
+        MessageId::try_from(i64::from(i32::MAX)).unwrap(),
+        MessageId(i32::MAX)
+    );
+    assert!(MessageId::try_from(-1).is_err());
+    assert!(MessageId::try_from(i64::from(i32::MAX) + 1).is_err());
+}
+
+#[test]
+fn a_negative_message_id_is_refused_on_decode() {
+    let bytes = [0x30, 0x05, 0x02, 0x01, 0xFF, 0x42, 0x00];
+    assert!(LdapMessage::decode(&bytes).is_err());
+}
+
+#[test]
+fn an_unsolicited_message_id_decodes() {
+    let bytes = [0x30, 0x05, 0x02, 0x01, 0x00, 0x42, 0x00];
+    let msg = LdapMessage::decode(&bytes).unwrap();
+    assert_eq!(msg.message_id, MessageId::UNSOLICITED);
+}
+
+#[test]
+fn trailing_bytes_after_a_message_are_refused() {
+    let mut bytes = LdapMessage {
+        message_id: MessageId(1),
+        operation: LdapOperation::UnbindRequest,
+        controls: vec![],
+    }
+    .encode();
+    bytes.push(0x00);
+    assert!(LdapMessage::decode(&bytes).is_err());
+}
+
+#[test]
+fn an_unbind_request_has_the_pinned_bytes() {
+    let msg = LdapMessage {
+        message_id: MessageId(2),
+        operation: LdapOperation::UnbindRequest,
+        controls: vec![],
+    };
+    let bytes = msg.encode();
+    assert_eq!(bytes, [0x30, 0x05, 0x02, 0x01, 0x02, 0x42, 0x00]);
+    assert_eq!(LdapMessage::decode(&bytes).unwrap(), msg);
+}
+
+#[test]
+fn a_delete_request_has_the_pinned_bytes() {
+    let msg = LdapMessage {
+        message_id: MessageId(5),
+        operation: LdapOperation::DeleteRequest("cn=a".into()),
+        controls: vec![],
+    };
+    let bytes = msg.encode();
+    assert_eq!(
+        bytes,
+        [
+            0x30, 0x09, 0x02, 0x01, 0x05, 0x4A, 0x04, b'c', b'n', b'=', b'a'
+        ]
+    );
+    assert_eq!(LdapMessage::decode(&bytes).unwrap(), msg);
+}
+
+#[test]
+fn an_abandon_request_has_the_pinned_bytes() {
+    let msg = LdapMessage {
+        message_id: MessageId(7),
+        operation: LdapOperation::AbandonRequest(MessageId(3)),
+        controls: vec![],
+    };
+    let bytes = msg.encode();
+    assert_eq!(bytes, [0x30, 0x06, 0x02, 0x01, 0x07, 0x50, 0x01, 0x03]);
+    assert_eq!(LdapMessage::decode(&bytes).unwrap(), msg);
+}
+
+#[test]
+fn an_anonymous_simple_bind_has_the_pinned_bytes() {
+    let msg = LdapMessage {
+        message_id: MessageId(1),
+        operation: LdapOperation::BindRequest(BindRequest {
+            version: 3,
+            name: String::new(),
+            authentication: BindAuthentication::Simple(zeroize::Zeroizing::new(Vec::new())),
+        }),
+        controls: vec![],
+    };
+    let bytes = msg.encode();
+    assert_eq!(
+        bytes,
+        [
+            0x30, 0x0C, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00
+        ]
+    );
+    assert_eq!(LdapMessage::decode(&bytes).unwrap(), msg);
+}
+
+#[test]
+fn every_request_decodes_what_it_encodes() {
+    let operations = [
+        LdapOperation::SearchRequest(SearchRequest {
+            base_dn: "dc=example,dc=com".into(),
+            scope: SearchScope::SingleLevel,
+            deref_aliases: DerefAliases::DerefAlways,
+            size_limit: 10,
+            time_limit: 30,
+            types_only: true,
+            filter: Filter::parse("(&(cn=a*)(!(uid=b)))").unwrap(),
+            attributes: vec!["cn".into(), "mail".into()],
+        }),
+        LdapOperation::AddRequest(AddRequest {
+            dn: "cn=a,dc=x".into(),
+            attributes: vec![PartialAttribute {
+                name: "cn".into(),
+                values: vec![b"a".to_vec(), vec![0xFF]],
+            }],
+        }),
+        LdapOperation::ModifyRequest(ModifyRequest {
+            dn: "cn=a,dc=x".into(),
+            changes: vec![Modification {
+                operation: ModifyOperation::Replace,
+                attribute: PartialAttribute {
+                    name: "sn".into(),
+                    values: vec![b"b".to_vec()],
+                },
+            }],
+        }),
+        LdapOperation::ModifyDnRequest(ModifyDnRequest {
+            dn: "cn=a,dc=x".into(),
+            new_rdn: "cn=b".into(),
+            delete_old_rdn: true,
+            new_superior: Some("dc=y".into()),
+        }),
+        LdapOperation::CompareRequest(CompareRequest {
+            dn: "cn=a,dc=x".into(),
+            attr: "sn".into(),
+            value: b"b".to_vec(),
+        }),
+        LdapOperation::ExtendedRequest(ExtendedRequest {
+            oid: "1.3.6.1.4.1.4203.1.11.3".into(),
+            value: None,
+        }),
+        LdapOperation::ExtendedRequest(ExtendedRequest {
+            oid: "1.2.3".into(),
+            value: Some(vec![1, 2, 3]),
+        }),
+    ];
+    for operation in operations {
+        let msg = LdapMessage {
+            message_id: MessageId(9),
+            operation,
+            controls: vec![],
+        };
+        assert_eq!(LdapMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+}
+
+#[test]
+fn a_sasl_bind_decodes_what_it_encodes() {
+    for credentials in [None, Some(b"creds".to_vec())] {
+        let msg = LdapMessage {
+            message_id: MessageId(1),
+            operation: LdapOperation::BindRequest(BindRequest {
+                version: 3,
+                name: String::new(),
+                authentication: BindAuthentication::Sasl {
+                    mechanism: "EXTERNAL".into(),
+                    credentials: credentials.map(zeroize::Zeroizing::new),
+                },
+            }),
+            controls: vec![],
+        };
+        assert_eq!(LdapMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+}
+
+#[test]
+fn every_response_encodes_without_panicking_and_decodes() {
+    use ldap_client_proto::{
+        BindResponse, ExtendedResponse, IntermediateResponse, LdapResult, ResultCode,
+        SearchResultEntry,
+    };
+    let result = LdapResult {
+        code: ResultCode::Referral,
+        matched_dn: "dc=x".into(),
+        diagnostic_message: "see elsewhere".into(),
+        referral: vec!["ldap://other/".into()],
+    };
+    let operations = [
+        LdapOperation::BindResponse(BindResponse {
+            result: result.clone(),
+            server_sasl_creds: Some(vec![1]),
+        }),
+        LdapOperation::SearchResultEntry(SearchResultEntry {
+            dn: "cn=a".into(),
+            attributes: vec![PartialAttribute {
+                name: "cn".into(),
+                values: vec![b"a".to_vec()],
+            }],
+        }),
+        LdapOperation::SearchResultDone(result.clone()),
+        LdapOperation::SearchResultReference(vec!["ldap://a/".into(), "ldap://b/".into()]),
+        LdapOperation::ModifyResponse(result.clone()),
+        LdapOperation::AddResponse(result.clone()),
+        LdapOperation::DeleteResponse(result.clone()),
+        LdapOperation::ModifyDnResponse(result.clone()),
+        LdapOperation::CompareResponse(result.clone()),
+        LdapOperation::ExtendedResponse(ExtendedResponse {
+            result,
+            oid: Some("1.2.3".into()),
+            value: Some(vec![9]),
+        }),
+        LdapOperation::IntermediateResponse(IntermediateResponse {
+            oid: Some("1.2.3".into()),
+            value: None,
+        }),
+    ];
+    for operation in operations {
+        let msg = LdapMessage {
+            message_id: MessageId(4),
+            operation,
+            controls: vec![],
+        };
+        assert_eq!(LdapMessage::decode(&msg.encode()).unwrap(), msg);
+    }
+}
+
+#[test]
+fn an_invalid_search_scope_is_refused() {
+    use ldap_client_ber::{BerWriter, Tag};
+    let mut w = BerWriter::new();
+    w.write_sequence(Tag::sequence(), |msg| {
+        msg.write_integer(1);
+        msg.write_sequence(Tag::application(3), |req| {
+            req.write_bytes(b"");
+            req.write_enumerated(9);
+        });
+    });
+    assert!(LdapMessage::decode(w.as_bytes()).is_err());
+}
+
+#[test]
+fn a_primitive_encoded_constructed_operation_is_refused() {
+    // A SearchResultDone ([APPLICATION 5]) written primitive.
+    let bytes = [0x30, 0x05, 0x02, 0x01, 0x01, 0x45, 0x00];
+    assert!(LdapMessage::decode(&bytes).is_err());
 }

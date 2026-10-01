@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::ProtoError;
 use crate::message::SearchScope;
+use crate::syntax::hex_pair_at;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LdapUrl {
@@ -76,35 +77,39 @@ impl LdapUrl {
             return Err(ProtoError::Protocol("missing host in LDAP URL".into()));
         }
 
-        // Parse path components: base_dn?attributes?scope?filter
-        let parts: Vec<&str> = path.splitn(4, '?').collect();
+        // base_dn?attributes?scope?filter?extensions
+        let parts: Vec<&str> = path.splitn(6, '?').collect();
+        if parts.len() > 5 {
+            return Err(ProtoError::Protocol(
+                "too many '?'-separated fields in LDAP URL".into(),
+            ));
+        }
+        let field = |i: usize| parts.get(i).copied().filter(|s| !s.is_empty());
 
-        let base_dn = parts
-            .first()
-            .filter(|s| !s.is_empty())
-            .map(|s| percent_decode(s));
+        // The client implements no extension, so a critical one must be refused (RFC 4516 section 2).
+        if let Some(critical) =
+            field(4).and_then(|exts| exts.split(',').find(|e| e.starts_with('!')))
+        {
+            return Err(ProtoError::Protocol(format!(
+                "unsupported critical LDAP URL extension: {critical}"
+            )));
+        }
 
-        let attributes = parts
-            .get(1)
-            .filter(|s| !s.is_empty())
+        let base_dn = field(0).map(percent_decode).transpose()?;
+
+        let attributes = field(1)
             .map(|s| {
                 s.split(',')
                     .filter(|a| !a.is_empty())
                     .map(percent_decode)
-                    .collect()
+                    .collect::<Result<_, _>>()
             })
+            .transpose()?
             .unwrap_or_default();
 
-        let scope = parts
-            .get(2)
-            .filter(|s| !s.is_empty())
-            .map(|s| parse_scope(s))
-            .transpose()?;
+        let scope = field(2).map(str::parse).transpose()?;
 
-        let filter = parts
-            .get(3)
-            .filter(|s| !s.is_empty())
-            .map(|s| percent_decode(s));
+        let filter = field(3).map(percent_decode).transpose()?;
 
         Ok(LdapUrl {
             scheme,
@@ -118,47 +123,49 @@ impl LdapUrl {
     }
 
     pub fn effective_port(&self) -> u16 {
-        self.port.unwrap_or(match self.scheme {
-            LdapScheme::Ldap => 389,
-            LdapScheme::Ldaps => 636,
-        })
+        self.port.unwrap_or(self.scheme.default_port())
     }
 }
 
-fn parse_scope(s: &str) -> Result<SearchScope, ProtoError> {
-    match s.to_ascii_lowercase().as_str() {
-        "base" => Ok(SearchScope::BaseObject),
-        "one" => Ok(SearchScope::SingleLevel),
-        "sub" => Ok(SearchScope::WholeSubtree),
-        _ => Err(ProtoError::Protocol(format!("unknown scope: {s}"))),
+impl LdapScheme {
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Self::Ldap => 389,
+            Self::Ldaps => 636,
+        }
     }
 }
 
-fn percent_decode(s: &str) -> String {
+/// A `%` that does not start a pair of hex digits stays as text: servers
+/// write the referral URLs this reads, and a literal `%` is unambiguous.
+fn percent_decode(s: &str) -> Result<String, ProtoError> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let Ok(byte) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            && let Some(byte) = hex_pair_at(bytes, i + 1)
         {
             out.push(byte);
             i += 3;
-            continue;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
         }
-        out.push(bytes[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out)
+        .map_err(|_| ProtoError::Protocol("invalid UTF-8 in percent-encoded LDAP URL field".into()))
 }
 
-fn percent_encode(s: &str) -> String {
+/// `extra_safe` lists the bytes besides the unreserved ones that stay as they are.
+fn percent_encode(s: &str, extra_safe: &[u8]) -> String {
     use std::fmt::Write;
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'=' | b',') {
+        if b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'.' | b'_' | b'~')
+            || extra_safe.contains(&b)
+        {
             out.push(b as char);
         } else {
             let _ = write!(out, "%{b:02X}");
@@ -175,7 +182,7 @@ impl fmt::Display for LdapUrl {
         };
         write!(f, "{scheme}://")?;
 
-        if self.host.contains(':') {
+        if self.host.contains(':') || self.host.starts_with('[') {
             write!(f, "[{}]", self.host)?;
         } else {
             write!(f, "{}", self.host)?;
@@ -188,7 +195,7 @@ impl fmt::Display for LdapUrl {
         write!(f, "/")?;
 
         if let Some(dn) = &self.base_dn {
-            write!(f, "{}", percent_encode(dn))?;
+            write!(f, "{}", percent_encode(dn, b"=,"))?;
         }
 
         // Only print subsequent fields if there's something to show
@@ -199,8 +206,11 @@ impl fmt::Display for LdapUrl {
         if has_attrs || has_scope || has_filter {
             write!(f, "?")?;
             if has_attrs {
-                let attrs: Vec<String> =
-                    self.attributes.iter().map(|a| percent_encode(a)).collect();
+                let attrs: Vec<String> = self
+                    .attributes
+                    .iter()
+                    .map(|a| percent_encode(a, b"="))
+                    .collect();
                 write!(f, "{}", attrs.join(","))?;
             }
         }
@@ -208,19 +218,14 @@ impl fmt::Display for LdapUrl {
         if has_scope || has_filter {
             write!(f, "?")?;
             if let Some(scope) = &self.scope {
-                let scope_str = match scope {
-                    SearchScope::BaseObject => "base",
-                    SearchScope::SingleLevel => "one",
-                    SearchScope::WholeSubtree => "sub",
-                };
-                write!(f, "{scope_str}")?;
+                write!(f, "{scope}")?;
             }
         }
 
         if has_filter {
             write!(f, "?")?;
             if let Some(filter) = &self.filter {
-                write!(f, "{}", percent_encode(filter))?;
+                write!(f, "{}", percent_encode(filter, b"=,"))?;
             }
         }
 

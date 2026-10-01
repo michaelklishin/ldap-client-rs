@@ -3,6 +3,9 @@
 use clap::Args;
 use ldap_client::{Client, Modification, ModifyOperation, PartialAttribute};
 
+use super::assignment::{Assignment, Removal};
+use crate::error::CliError;
+
 #[derive(Args)]
 pub struct ModifyArgs {
     /// DN of the entry to modify
@@ -11,68 +14,43 @@ pub struct ModifyArgs {
 
     /// Add attribute values (NAME=VALUE, repeatable)
     #[arg(long = "add", value_name = "NAME=VALUE")]
-    adds: Vec<String>,
+    adds: Vec<Assignment>,
 
     /// Replace attribute values (NAME=VALUE, repeatable)
     #[arg(long = "replace", value_name = "NAME=VALUE")]
-    replaces: Vec<String>,
+    replaces: Vec<Assignment>,
 
     /// Delete attribute values (NAME or NAME=VALUE, repeatable)
     #[arg(long = "delete", value_name = "NAME[=VALUE]")]
-    deletes: Vec<String>,
+    deletes: Vec<Removal>,
 }
 
-pub async fn run(client: &Client, args: ModifyArgs) -> Result<(), ldap_client::Error> {
-    let mut changes = Vec::new();
-
-    for kv in &args.adds {
-        let (name, value) = parse_kv(kv)?;
-        changes.push(Modification {
-            operation: ModifyOperation::Add,
-            attribute: PartialAttribute {
-                name: name.to_string(),
-                values: vec![value.as_bytes().to_vec()],
-            },
-        });
+fn modification(operation: ModifyOperation, name: String, value: Option<Vec<u8>>) -> Modification {
+    Modification {
+        operation,
+        attribute: PartialAttribute {
+            name,
+            values: value.into_iter().collect(),
+        },
     }
+}
 
-    for kv in &args.replaces {
-        let (name, value) = parse_kv(kv)?;
-        changes.push(Modification {
-            operation: ModifyOperation::Replace,
-            attribute: PartialAttribute {
-                name: name.to_string(),
-                values: vec![value.as_bytes().to_vec()],
-            },
-        });
-    }
-
-    for kv in &args.deletes {
-        if let Some((name, value)) = kv.split_once('=') {
-            changes.push(Modification {
-                operation: ModifyOperation::Delete,
-                attribute: PartialAttribute {
-                    name: name.to_string(),
-                    values: vec![value.as_bytes().to_vec()],
-                },
-            });
-        } else {
-            changes.push(Modification {
-                operation: ModifyOperation::Delete,
-                attribute: PartialAttribute {
-                    name: kv.to_string(),
-                    values: vec![],
-                },
-            });
-        }
-    }
+pub async fn run(client: &Client, args: ModifyArgs) -> Result<(), CliError> {
+    let adds = args
+        .adds
+        .into_iter()
+        .map(|a| modification(ModifyOperation::Add, a.name, Some(a.value)));
+    let replaces = args
+        .replaces
+        .into_iter()
+        .map(|a| modification(ModifyOperation::Replace, a.name, Some(a.value)));
+    let deletes = args
+        .deletes
+        .into_iter()
+        .map(|r| modification(ModifyOperation::Delete, r.name, r.value));
+    let changes: Vec<Modification> = adds.chain(replaces).chain(deletes).collect();
 
     client.modify(&args.dn, changes).await?;
     println!("entry modified: {}", args.dn);
     Ok(())
-}
-
-fn parse_kv(kv: &str) -> Result<(&str, &str), ldap_client::Error> {
-    kv.split_once('=')
-        .ok_or_else(|| ldap_client::Error::InvalidUrl(format!("expected NAME=VALUE, got: {kv}")))
 }

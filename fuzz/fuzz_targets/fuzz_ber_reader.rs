@@ -2,8 +2,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use ldap_client_ber::BerReader;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut r = BerReader::new(data);

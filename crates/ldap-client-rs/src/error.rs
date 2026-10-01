@@ -3,6 +3,7 @@
 use ldap_client_proto::ResultCode;
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -49,6 +50,9 @@ pub enum Error {
 
     #[error("search result entry limit exceeded ({0})")]
     SearchEntryLimitExceeded(usize),
+
+    #[error("refusing an unauthenticated bind: the DN is set and the password is empty")]
+    UnauthenticatedBind,
 }
 
 impl Error {
@@ -57,6 +61,18 @@ impl Error {
             code: result.code,
             message: result.diagnostic_message.clone(),
             matched_dn: result.matched_dn.clone(),
+        }
+    }
+
+    /// A referral for a referral result, an LDAP error for any other.
+    pub(crate) fn from_failed_result(result: &ldap_client_proto::LdapResult) -> Self {
+        if result.code.is_referral() {
+            Self::Referral {
+                urls: result.referral.clone(),
+                result: result.clone(),
+            }
+        } else {
+            Self::ldap(result)
         }
     }
 

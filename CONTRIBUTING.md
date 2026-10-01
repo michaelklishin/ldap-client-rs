@@ -4,8 +4,8 @@ See also [AGENTS.md](./AGENTS.md) for a high-level codebase overview and convent
 
 ## Prerequisites
 
- * Rust toolchain >= 1.93 (MSRV) and stable
- * Docker, Podman or Rancher for integration tests
+ * Rust toolchain >= 1.98.1 (MSRV) and stable
+ * Docker, Podman or Rancher for running `slapd` in a container for integration tests
  * Nushell (for running development scripts)
 
 ## Running Tests

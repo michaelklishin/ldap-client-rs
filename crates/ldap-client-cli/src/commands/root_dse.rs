@@ -2,18 +2,10 @@
 
 use ldap_client::Client;
 
-pub async fn run(client: &Client) -> Result<(), ldap_client::Error> {
-    let entry = client.root_dse().await?;
+use super::output::print_entry;
+use crate::error::CliError;
 
-    println!("dn: {}", entry.dn);
-    for attr in &entry.attributes {
-        for val in &attr.values {
-            match std::str::from_utf8(val) {
-                Ok(s) => println!("{}: {s}", attr.name),
-                Err(_) => println!("{}: <binary {} bytes>", attr.name, val.len()),
-            }
-        }
-    }
-
+pub async fn run(client: &Client) -> Result<(), CliError> {
+    print_entry(&client.root_dse().await?);
     Ok(())
 }

@@ -94,4 +94,18 @@ proptest! {
             Ok(())
         }).unwrap();
     }
+
+    #[test]
+    fn prop_reader_never_panics(input in proptest::collection::vec(any::<u8>(), 0..256)) {
+        let mut r = BerReader::new(&input);
+        let _ = r.peek_is(Tag::sequence());
+        let _ = r.read_sequence(Tag::sequence(), |inner| {
+            inner.read_integer()?;
+            inner.read_octet_string()
+        });
+        let _ = r.read_element();
+        let _ = r.read_octet_string();
+        let _ = r.read_implicit(Tag::context(0));
+        let _ = r.finish();
+    }
 }

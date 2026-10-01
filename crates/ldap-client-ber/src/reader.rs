@@ -4,6 +4,12 @@ use crate::BerError;
 use crate::length::decode_length;
 use crate::tag::{BOOLEAN, Class, ENUMERATED, INTEGER, OCTET_STRING, Tag};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Trailing {
+    Reject,
+    Allow,
+}
+
 /// Zero-copy BER decoder over a byte slice.
 pub struct BerReader<'a> {
     input: &'a [u8],
@@ -84,7 +90,22 @@ impl<'a> BerReader<'a> {
     /// passing a sub-reader scoped to its contents.
     pub fn read_sequence<F, T>(&mut self, expected_tag: Tag, f: F) -> Result<T, BerError>
     where
-        F: FnOnce(&mut BerReader<'_>) -> Result<T, BerError>,
+        F: FnOnce(&mut BerReader<'a>) -> Result<T, BerError>,
+    {
+        self.enter(expected_tag, Trailing::Reject, f)
+    }
+
+    /// Like `read_sequence` but allows trailing data in the constructed element.
+    pub fn read_sequence_lax<F, T>(&mut self, expected_tag: Tag, f: F) -> Result<T, BerError>
+    where
+        F: FnOnce(&mut BerReader<'a>) -> Result<T, BerError>,
+    {
+        self.enter(expected_tag, Trailing::Allow, f)
+    }
+
+    fn enter<F, T>(&mut self, expected_tag: Tag, trailing: Trailing, f: F) -> Result<T, BerError>
+    where
+        F: FnOnce(&mut BerReader<'a>) -> Result<T, BerError>,
     {
         let (tag, value) = self.read_element()?;
         if tag != expected_tag {
@@ -107,90 +128,44 @@ impl<'a> BerReader<'a> {
             max_element_size: self.max_element_size,
         };
         let result = f(&mut sub)?;
-        if !sub.input.is_empty() {
-            return Err(BerError::TrailingData {
-                remaining: sub.input.len(),
-            });
+        if trailing == Trailing::Reject {
+            sub.finish()?;
         }
         Ok(result)
     }
 
-    /// Like `read_sequence` but allows trailing data in the constructed element.
-    pub fn read_sequence_lax<F, T>(&mut self, expected_tag: Tag, f: F) -> Result<T, BerError>
-    where
-        F: FnOnce(&mut BerReader<'_>) -> Result<T, BerError>,
-    {
+    fn read_primitive(&mut self, expected: Tag) -> Result<&'a [u8], BerError> {
         let (tag, value) = self.read_element()?;
-        if tag != expected_tag {
+        if tag != expected {
             return Err(BerError::UnexpectedTag {
-                expected: expected_tag,
+                expected,
                 actual: tag,
             });
-        }
-
-        if self.depth >= self.max_depth {
-            return Err(BerError::RecursionLimit {
-                max: self.max_depth,
-            });
-        }
-
-        let mut sub = BerReader {
-            input: value,
-            depth: self.depth + 1,
-            max_depth: self.max_depth,
-            max_element_size: self.max_element_size,
-        };
-        f(&mut sub)
-    }
-
-    pub fn read_integer(&mut self) -> Result<i64, BerError> {
-        let (tag, value) = self.read_element()?;
-        if tag.number != INTEGER || tag.class != Class::Universal || tag.constructed {
-            return Err(BerError::UnexpectedTag {
-                expected: Tag::universal(INTEGER),
-                actual: tag,
-            });
-        }
-        decode_integer(value)
-    }
-
-    pub fn read_octet_string(&mut self) -> Result<&'a [u8], BerError> {
-        let (tag, value) = self.read_element()?;
-        if tag.number != OCTET_STRING || tag.class != Class::Universal {
-            return Err(BerError::UnexpectedTag {
-                expected: Tag::universal(OCTET_STRING),
-                actual: tag,
-            });
-        }
-        if tag.constructed {
-            return Err(BerError::ConstructedPrimitive);
         }
         Ok(value)
     }
 
+    pub fn read_integer(&mut self) -> Result<i64, BerError> {
+        decode_integer(self.read_primitive(Tag::universal(INTEGER))?)
+    }
+
+    pub fn read_octet_string(&mut self) -> Result<&'a [u8], BerError> {
+        let expected = Tag::universal(OCTET_STRING);
+        match self.peek_tag()? {
+            tag if tag == expected.with_constructed(true) => Err(BerError::ConstructedPrimitive),
+            _ => self.read_primitive(expected),
+        }
+    }
+
     pub fn read_boolean(&mut self) -> Result<bool, BerError> {
-        let (tag, value) = self.read_element()?;
-        if tag.number != BOOLEAN || tag.class != Class::Universal || tag.constructed {
-            return Err(BerError::UnexpectedTag {
-                expected: Tag::universal(BOOLEAN),
-                actual: tag,
-            });
+        match self.read_primitive(Tag::universal(BOOLEAN))? {
+            [byte] => Ok(*byte != 0),
+            _ => Err(BerError::InvalidBoolean),
         }
-        if value.len() != 1 {
-            return Err(BerError::InvalidBoolean);
-        }
-        Ok(value[0] != 0)
     }
 
     pub fn read_enumerated(&mut self) -> Result<i64, BerError> {
-        let (tag, value) = self.read_element()?;
-        if tag.number != ENUMERATED || tag.class != Class::Universal || tag.constructed {
-            return Err(BerError::UnexpectedTag {
-                expected: Tag::universal(ENUMERATED),
-                actual: tag,
-            });
-        }
-        decode_integer(value)
+        decode_integer(self.read_primitive(Tag::universal(ENUMERATED))?)
     }
 
     /// Read an element with any tag, returning its raw bytes.
@@ -198,19 +173,39 @@ impl<'a> BerReader<'a> {
         self.read_element()
     }
 
-    /// Read a tagged implicit octet string (context-tagged primitive).
+    pub fn read_implicit(&mut self, tag: Tag) -> Result<&'a [u8], BerError> {
+        self.read_primitive(tag)
+    }
+
     pub fn read_tagged_implicit_octet_string(
         &mut self,
         expected_number: u32,
     ) -> Result<&'a [u8], BerError> {
-        let (tag, value) = self.read_element()?;
-        if tag.class != Class::Context || tag.number != expected_number {
-            return Err(BerError::UnexpectedTag {
-                expected: Tag::context(expected_number),
-                actual: tag,
-            });
+        self.read_implicit(Tag::context(expected_number))
+    }
+
+    pub fn read_each<T, F>(&mut self, mut f: F) -> Result<Vec<T>, BerError>
+    where
+        F: FnMut(&mut BerReader<'a>) -> Result<T, BerError>,
+    {
+        let mut items = Vec::new();
+        while !self.is_empty() {
+            items.push(f(self)?);
         }
-        Ok(value)
+        Ok(items)
+    }
+
+    /// Whether the next element has exactly this tag. False on empty or
+    /// malformed input; the read that follows reports the error.
+    pub fn peek_is(&self, tag: Tag) -> bool {
+        self.peek_tag().is_ok_and(|t| t == tag)
+    }
+
+    pub fn finish(&self) -> Result<(), BerError> {
+        match self.input.len() {
+            0 => Ok(()),
+            remaining => Err(BerError::TrailingData { remaining }),
+        }
     }
 }
 
@@ -267,6 +262,10 @@ fn parse_tag(input: &[u8]) -> Result<(Tag, usize), BerError> {
         },
         i,
     ))
+}
+
+pub fn decode_i64_bytes(bytes: &[u8]) -> Result<i64, BerError> {
+    decode_integer(bytes)
 }
 
 fn decode_integer(bytes: &[u8]) -> Result<i64, BerError> {

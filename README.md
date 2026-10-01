@@ -17,7 +17,7 @@ This library is young. Before `1.0`, breaking API changes are possible.
 
 ## Requirements
 
- * Rust 1.93+ (edition 2024)
+ * Rust 1.98.1+ (edition 2024)
  * Tokio runtime
 
 
@@ -190,10 +190,7 @@ use ldap_client::{ClientBuilder, TlsConfig, TlsVersion, Transport};
 
 let client = ClientBuilder::new("ldap.example.com", 636)
     .transport(Transport::Tls)
-    .tls(TlsConfig {
-        min_tls_version: TlsVersion::Tls12,
-        ..Default::default()
-    })?
+    .tls(TlsConfig::default().min_tls_version(TlsVersion::Tls13))?
     .connect().await?;
 ```
 

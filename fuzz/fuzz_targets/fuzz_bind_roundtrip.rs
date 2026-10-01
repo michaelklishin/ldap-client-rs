@@ -2,10 +2,8 @@
 
 #![no_main]
 
+use ldap_client_proto::{BindAuthentication, BindRequest, LdapMessage, LdapOperation, MessageId};
 use libfuzzer_sys::fuzz_target;
-use ldap_client_proto::{
-    BindAuthentication, BindRequest, LdapMessage, LdapOperation, MessageId,
-};
 
 fuzz_target!(|data: &[u8]| {
     // Split fuzzer input into DN and password portions.
@@ -21,9 +19,7 @@ fuzz_target!(|data: &[u8]| {
         operation: LdapOperation::BindRequest(BindRequest {
             version: 3,
             name: dn.clone(),
-            authentication: BindAuthentication::Simple(
-                zeroize::Zeroizing::new(pw_bytes.to_vec()),
-            ),
+            authentication: BindAuthentication::Simple(zeroize::Zeroizing::new(pw_bytes.to_vec())),
         }),
         controls: vec![],
     };

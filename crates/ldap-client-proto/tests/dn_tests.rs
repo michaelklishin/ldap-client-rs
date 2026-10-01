@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use ldap_client_proto::dn::{Dn, escape_dn_value};
+use ldap_client_proto::dn::{AttributeValue, Dn, escape_dn_value};
 
 #[test]
 fn parse_empty() {
@@ -33,14 +33,10 @@ fn multi_valued_rdn() {
     let dn = Dn::parse("cn=John+sn=Doe,dc=example,dc=com").unwrap();
     assert_eq!(dn.rdns.len(), 3);
     assert_eq!(dn.rdns[0].components.len(), 2);
-    assert_eq!(
-        dn.rdns[0].components[0],
-        ("cn".to_string(), "John".to_string())
-    );
-    assert_eq!(
-        dn.rdns[0].components[1],
-        ("sn".to_string(), "Doe".to_string())
-    );
+    assert_eq!(dn.rdns[0].components[0].0, "cn");
+    assert_eq!(dn.rdns[0].components[0].1, "John");
+    assert_eq!(dn.rdns[0].components[1].0, "sn");
+    assert_eq!(dn.rdns[0].components[1].1, "Doe");
 }
 
 #[test]
@@ -59,7 +55,10 @@ fn escaped_hex_pair() {
 #[test]
 fn hex_encoded_value() {
     let dn = Dn::parse("cn=#414243,dc=example,dc=com").unwrap();
-    assert_eq!(dn.rdns[0].components[0].1, "#414243");
+    assert_eq!(
+        dn.rdns[0].components[0].1,
+        AttributeValue::Ber(vec![0x41, 0x42, 0x43])
+    );
 }
 
 #[test]
@@ -181,4 +180,162 @@ fn hex_string_empty_rejected() {
 fn invalid_utf8_hex_escape_rejected() {
     // \FF is not valid UTF-8 (lone byte > 0x7F)
     assert!(Dn::parse(r"cn=\FF,dc=example,dc=com").is_err());
+}
+
+#[test]
+fn an_escaped_multibyte_character_is_refused() {
+    assert!(Dn::parse(r"cn=\é").is_err());
+}
+
+#[test]
+fn text_after_a_quoted_value_with_multibyte_characters_is_refused() {
+    assert!(Dn::parse("cn=\"a\"€€€€").is_err());
+}
+
+#[test]
+fn a_trailing_backslash_is_refused() {
+    assert!(Dn::parse(r"cn=foo\").is_err());
+}
+
+#[test]
+fn an_escape_outside_the_rfc_4514_set_is_refused() {
+    assert!(Dn::parse(r"cn=\a").is_err());
+}
+
+#[test]
+fn a_hex_escaped_multibyte_character_decodes() {
+    let dn = Dn::parse(r"cn=\c3\a9").unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "é");
+}
+
+#[test]
+fn an_escape_error_names_the_byte_offset() {
+    let err = Dn::parse(r"cn=ab\q").unwrap_err().to_string();
+    assert!(err.contains("byte 5"), "{err}");
+}
+
+#[test]
+fn every_rfc_4514_escapable_character_decodes() {
+    for c in ['\\', '"', '+', ',', ';', '<', '>', ' ', '#', '='] {
+        let dn = Dn::parse(&format!("cn=a\\{c}b")).unwrap();
+        assert_eq!(dn.rdns[0].components[0].1, format!("a{c}b").as_str());
+    }
+}
+
+#[test]
+fn quoted_values_parse() {
+    let dn = Dn::parse(r#"cn="a,b",dc=example"#).unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "a,b");
+    assert_eq!(dn.rdns.len(), 2);
+}
+
+#[test]
+fn an_unterminated_quote_is_refused() {
+    assert!(Dn::parse(r#"cn="abc"#).is_err());
+}
+
+#[test]
+fn an_escaped_trailing_space_at_the_end_is_kept() {
+    let dn = Dn::parse(r"cn=foo\ ").unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "foo ");
+}
+
+#[test]
+fn unescaped_trailing_whitespace_at_the_end_is_dropped() {
+    let dn = Dn::parse("cn=foo \t\n").unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "foo");
+}
+
+#[test]
+fn escape_dn_value_output_parses_back() {
+    for value in ["foo ", " foo", "#foo", "a,b", "a\0b", "foo\n", "a\\b"] {
+        let dn = Dn::parse(&format!("cn={}", escape_dn_value(value))).unwrap();
+        assert_eq!(dn.rdns[0].components[0].1, value, "{value:?}");
+    }
+}
+
+#[test]
+fn spaces_after_a_hex_value_are_skipped() {
+    let dn = Dn::parse("cn=#41 ,dc=x").unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, AttributeValue::Ber(vec![0x41]));
+    assert_eq!(dn.rdns.len(), 2);
+}
+
+#[test]
+fn spaces_after_a_quoted_value_are_skipped() {
+    let dn = Dn::parse(r#"cn="a" ,dc=x"#).unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "a");
+    assert_eq!(dn.rdns.len(), 2);
+}
+
+#[test]
+fn an_attribute_type_with_a_space_is_refused() {
+    assert!(Dn::parse("c n=x").is_err());
+}
+
+#[test]
+fn an_attribute_type_with_a_quote_is_refused() {
+    assert!(Dn::parse("cn\"=y").is_err());
+}
+
+#[test]
+fn a_numeric_oid_attribute_type_is_accepted() {
+    let dn = Dn::parse("2.5.4.3=x").unwrap();
+    assert_eq!(dn.rdns[0].components[0].0, "2.5.4.3");
+}
+
+#[test]
+fn an_attribute_type_with_an_underscore_is_accepted() {
+    assert!(Dn::parse("my_attr=x").is_ok());
+}
+
+#[test]
+fn display_escapes_an_invalid_attribute_type() {
+    let dn = Dn {
+        rdns: vec![ldap_client_proto::dn::Rdn {
+            components: vec![("cn=x,dc".into(), "evil".into())],
+        }],
+    };
+    assert!(Dn::parse(&dn.to_string()).is_err());
+}
+
+#[test]
+fn a_hex_value_round_trips() {
+    let dn = Dn::parse("cn=#0403616263,dc=example").unwrap();
+    assert_eq!(dn.to_string(), "cn=#0403616263,dc=example");
+    assert_eq!(Dn::parse(&dn.to_string()).unwrap(), dn);
+}
+
+#[test]
+fn an_escaped_hash_stays_text() {
+    let dn = Dn::parse(r"cn=\#04026869").unwrap();
+    assert_eq!(dn.rdns[0].components[0].1, "#04026869");
+    assert_eq!(dn.to_string(), r"cn=\#04026869");
+}
+
+#[test]
+fn a_text_value_equals_a_str() {
+    let value = AttributeValue::from("x");
+    assert_eq!(value, "x");
+    assert_eq!(value.as_text(), Some("x"));
+    assert_ne!(AttributeValue::Ber(b"x".to_vec()), "x");
+    assert_eq!(AttributeValue::Ber(vec![1]).as_text(), None);
+}
+
+#[test]
+fn the_parent_of_a_three_rdn_dn_has_two() {
+    let dn = Dn::parse("cn=a,ou=b,dc=c").unwrap();
+    assert_eq!(dn.parent().unwrap(), Dn::parse("ou=b,dc=c").unwrap());
+}
+
+#[test]
+fn a_single_rdn_has_no_parent() {
+    assert!(Dn::parse("dc=c").unwrap().parent().is_none());
+    assert!(Dn::parse("").unwrap().parent().is_none());
+}
+
+#[test]
+fn trailing_whitespace_after_a_hex_or_quoted_value_is_dropped() {
+    assert!(Dn::parse("cn=#41\n").is_ok());
+    assert!(Dn::parse("cn=\"a\"\r\n").is_ok());
 }

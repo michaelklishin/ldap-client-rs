@@ -21,6 +21,11 @@ path = "fuzz_targets/fuzz_ber_reader.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_dn_parser"
+path = "fuzz_targets/fuzz_dn_parser.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_filter_parser"
 path = "fuzz_targets/fuzz_filter_parser.rs"
 doc = false

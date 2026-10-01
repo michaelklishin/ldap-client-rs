@@ -2,6 +2,7 @@
 
 mod cli;
 mod commands;
+mod error;
 
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -18,6 +19,6 @@ async fn main() {
 
     if let Err(e) = cli.run().await {
         eprintln!("error: {e}");
-        std::process::exit(1);
+        std::process::exit(e.exit_code());
     }
 }
