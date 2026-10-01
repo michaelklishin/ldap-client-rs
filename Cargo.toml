@@ -42,3 +42,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 proptest    = "1"
 pretty_assertions = "1"
 criterion   = { version = "0.5", features = ["html_reports"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+lto = "off"
+
+[profile.test]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+lto = "off"
