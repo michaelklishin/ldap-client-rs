@@ -8,26 +8,47 @@ on:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  validate:
+    name: Validate
     runs-on: ubuntu-24.04
-    environment: release
-    timeout-minutes: 15
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.validate-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v7
 
-      - uses: michaelklishin/rust-build-package-release-action@v2
+      - uses: michaelklishin/rust-build-package-release-action@v3
+        with:
+          command: validate-changelog
+
+      - uses: michaelklishin/rust-build-package-release-action@v3
+        id: validate-version
         with:
           command: validate-version
           validate-cargo-toml: 'true'
+
+  publish:
+    name: Publish to crates.io
+    needs: [validate]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Authenticate with crates.io
         id: auth
@@ -38,7 +59,7 @@ jobs:
       # re-running a partially failed release is safe.
 
       - name: Publish ldap-client-ber
-        uses: michaelklishin/rust-build-package-release-action@v2
+        uses: michaelklishin/rust-build-package-release-action@v3
         with:
           command: publish-crate
           package: ldap-client-ber
@@ -47,7 +68,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish ldap-client-proto
-        uses: michaelklishin/rust-build-package-release-action@v2
+        uses: michaelklishin/rust-build-package-release-action@v3
         with:
           command: publish-crate
           package: ldap-client-proto
@@ -56,7 +77,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish ldap-client
-        uses: michaelklishin/rust-build-package-release-action@v2
+        uses: michaelklishin/rust-build-package-release-action@v3
         with:
           command: publish-crate
           package: ldap-client
@@ -65,7 +86,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
       - name: Publish ldap-client-cli
-        uses: michaelklishin/rust-build-package-release-action@v2
+        uses: michaelklishin/rust-build-package-release-action@v3
         with:
           command: publish-crate
           package: ldap-client-cli
@@ -74,21 +95,21 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   github-release:
-    name: Create GitHub Release
+    name: GitHub Release
+    needs: [validate, publish]
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: michaelklishin/rust-build-package-release-action@v2
-        id: changelog
+      - uses: michaelklishin/rust-build-package-release-action@v3
         with:
           command: extract-changelog
+          version: ${{ needs.validate.outputs.version }}
 
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: false
           body_path: release_notes.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
