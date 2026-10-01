@@ -13,7 +13,6 @@ all feature-gated code (vendor TLV parsing, axum integration) is included.
  * `cargo nextest run --all-features` to run tests
  * `cargo clippy --all-features` to lint
  * `cargo fmt` to reformat
- * `cargo publish` to publish the crate
 
 Always run `cargo check --all-features` before making changes to verify the codebase compiles cleanly.
 If compilation fails, investigate and fix compilation errors before proceeding with any modifications.
@@ -98,16 +97,27 @@ a `## v0.N.0 (in development)` section at the top.
 To produce a new release:
 
  1. Update the changelog: replace `(in development)` with today's date, e.g. `(Feb 20, 2026)`. Make sure all notable changes since the previous release are listed
- 2. Commit with the message `0.N.0` (just the version number, nothing else)
- 3. Tag the commit: `git tag v0.N.0`
- 4. Bump the dev version: back on `main`, set `Cargo.toml` workspace version to `0.(N+1).0` and update the version in `[workspace.dependencies]` and `crates/ldap-client-cli/Cargo.toml`
- 5. Add a new `## v0.(N+1).0 (in development)` section to `CHANGELOG.md` with `No changes yet.` underneath
- 6. Commit with the message `Bump dev version`
- 7. Push: `git push && git push --tags`
+ 2. Refresh `Cargo.lock` so it matches `Cargo.toml`: `cargo update --workspace`. Then verify the crates.io publish step will pass: `cargo publish --workspace --dry-run --locked --allow-dirty`. If the dry-run fails with `cannot update the lock file ... because --locked was passed`, the lockfile is stale. Fix it before tagging
+ 3. Commit changelog and lockfile changes with the message `0.N.0` (just the version number, nothing else)
+ 4. Tag the commit: `git tag v0.N.0`
+ 5. Bump the dev version: back on `main`, set `Cargo.toml` workspace version to `0.(N+1).0` and update the version in `[workspace.dependencies]` and `crates/ldap-client-cli/Cargo.toml`
+ 6. Run `cargo generate-lockfile`
+ 7. Add a new `## v0.(N+1).0 (in development)` section to `CHANGELOG.md` with `No changes yet.` underneath
+ 8. Commit with the message `Bump dev version`
+ 9. Push: `git push && git push --tags`
+ 10. GitHub Actions workflow now publishes the crates to crates.io using [Trusted Publishing](https://blog.rust-lang.org/2023/11/10/trusted-publishing.html) and publishes a GitHub Release with the changelog section as release notes. No manual `cargo publish` needed
 
-The tag push triggers `.github/workflows/release.yml`, which publishes the crates to crates.io
-via Trusted Publishing (OIDC) and creates a GitHub Release with changelog notes. No manual
-`cargo publish` needed.
+### GitHub Actions
+
+The release workflow (`.github/workflows/release.yml`) uses [`michaelklishin/rust-build-package-release-action`](https://github.com/michaelklishin/rust-build-package-release-action) at `@v3`.
+
+It first checks that `CHANGELOG.md` has an entry for the version and that the tag matches the `Cargo.toml` version, then publishes `ldap-client-ber`, `ldap-client-proto`, `ldap-client` and `ldap-client-cli` in that order. A publish step skips a version that already exists on crates.io, so a partially failed release can be re-run.
+
+The Trusted Publishing setup requires a GitHub Actions environment named `release` and a
+Trusted Publisher registered on crates.io for each of the four crates (workflow filename `release.yml`, environment `release`).
+Crates have "Require trusted publishing" enabled, so publishing with an API token is rejected.
+
+For verifying YAML file syntax, use `yq`, Ruby or Python YAML modules (whichever is available).
 
 ## Git Commits
 
