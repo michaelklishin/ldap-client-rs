@@ -1,5 +1,9 @@
 # ldap-client-rs Change Log
 
+## v0.9.0 (in development)
+
+No changes yet.
+
 ## v0.8.0 (Sep 30, 2026)
 
 This release focuses on refactoring, subtle bug fixes and small behavior nuances that
